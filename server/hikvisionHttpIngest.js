@@ -124,6 +124,125 @@ function firstJpegDataUrlFromMultipart(buf, contentType) {
   return "";
 }
 
+/**
+ * multipart/form-data ichidan Content-Disposition name= bo‘yicha qism tanasini ajratadi.
+ */
+function extractMultipartPartByFieldName(buffer, contentType, fieldName) {
+  const want = String(fieldName || "").toLowerCase();
+  if (!want || !Buffer.isBuffer(buffer)) return null;
+  const ct = String(contentType || "");
+  const bm = ct.match(/boundary\s*=\s*"?([^";\s]+)"?/i);
+  if (!bm) return null;
+  const boundaryStr = bm[1].trim().replace(/^["']|["']$/g, "");
+  const delimiter = Buffer.from(`--${boundaryStr}`);
+  let offset = 0;
+  for (;;) {
+    const idx = buffer.indexOf(delimiter, offset);
+    if (idx < 0) break;
+    let partBegin = idx + delimiter.length;
+    if (partBegin + 1 < buffer.length && buffer[partBegin] === 0x2d && buffer[partBegin + 1] === 0x2d) {
+      break;
+    }
+    if (partBegin + 1 < buffer.length && buffer[partBegin] === 0x0d && buffer[partBegin + 1] === 0x0a) {
+      partBegin += 2;
+    } else if (partBegin < buffer.length && buffer[partBegin] === 0x0a) {
+      partBegin += 1;
+    }
+    const nextBoundary = buffer.indexOf(delimiter, partBegin);
+    const partEnd = nextBoundary < 0 ? buffer.length : nextBoundary;
+    const part = buffer.subarray(partBegin, partEnd);
+    const headerSep = part.indexOf(Buffer.from("\r\n\r\n"));
+    if (headerSep < 0) {
+      offset = idx + delimiter.length;
+      continue;
+    }
+    const headers = part.subarray(0, headerSep).toString("latin1");
+    const nameMatch = headers.match(/name\s*=\s*"([^"]+)"/i) || headers.match(/name\s*=\s*([^;\r\n]+)/i);
+    const fn = nameMatch ? String(nameMatch[1] || nameMatch[2]).trim().replace(/^"|"$/g, "") : "";
+    if (fn.toLowerCase() !== want) {
+      offset = idx + delimiter.length;
+      continue;
+    }
+    let body = part.subarray(headerSep + 4);
+    while (
+      body.length >= 2 &&
+      body[body.length - 2] === 0x0d &&
+      body[body.length - 1] === 0x0a
+    ) {
+      body = body.subarray(0, body.length - 2);
+    }
+    while (body.length >= 1 && body[body.length - 1] === 0x0a) {
+      body = body.subarray(0, body.length - 1);
+    }
+    return body.length > 0 ? body : null;
+  }
+  return null;
+}
+
+/** Hikvision AccessControl JSON obyektidan hodisa qo‘shadi (HTTP multipart ichidagi JSON). */
+function appendEventsFromHikvisionJson(j, out) {
+  const root = Array.isArray(j) ? j[0] : j;
+  if (!root || typeof root !== "object") return;
+
+  const dip = root.ipAddress || root.deviceIP || root.IpAddress || root.AccessControlEvent?.ipAddress || "";
+  if (dip && String(dip).trim()) {
+    if (!out.deviceIp) out.deviceIp = String(dip).trim();
+  }
+
+  const ac = root.AccessControlEvent || root.accessControlEvent || root;
+  if (!ac || typeof ac !== "object") return;
+
+  const picRaw =
+    ac.picture ?? ac.Picture ?? ac.SNAPPicture ?? ac.snapPicture ?? ac.faceSnap ?? ac.pictureData;
+  const picNorm = picRaw != null ? normalizeEventSnapshot(picRaw) : "";
+  const pathRaw =
+    ac.pictureURL ??
+    ac.PictureURL ??
+    ac.pictureUrl ??
+    ac.PictureUrl ??
+    ac.snapPictureURL ??
+    ac.SnapPictureURL;
+  const pathNorm = pathRaw != null ? String(pathRaw).trim() : "";
+  const ev = {
+    employeeNoString: ac.employeeNoString ?? ac.employeeNo,
+    employeeNo: ac.employeeNo,
+    cardNo: ac.cardNo,
+    time: ac.time ?? ac.dateTime ?? root?.dateTime,
+    major: ac.major ?? root?.major,
+    minor: ac.minor ?? root?.minor,
+  };
+  const displayName = personNameFromAccessControl(ac);
+  if (displayName) ev.name = displayName;
+  const hintKeys = [
+    "attendanceState",
+    "AttendanceState",
+    "accessType",
+    "AccessType",
+    "direction",
+    "eventType",
+    "subEventType",
+    "currentEventType",
+    "accessChannel",
+    "label",
+  ];
+  for (const k of hintKeys) {
+    if (ac[k] != null && String(ac[k]).trim()) ev[k] = String(ac[k]).trim();
+  }
+  if (picNorm) ev.picture = picNorm;
+  if (pathNorm) {
+    if (/^https?:\/\//i.test(pathNorm)) {
+      try {
+        ev.pictureURL = cleanTerminalImagePath(new URL(pathNorm).pathname);
+      } catch {
+        /* ignore */
+      }
+    } else if (pathNorm.startsWith("/") || /LOCALS/i.test(pathNorm)) {
+      ev.pictureURL = cleanTerminalImagePath(pathNorm);
+    }
+  }
+  out.events.push(ev);
+}
+
 function personNameFromXmlBlock(block) {
   if (!block || typeof block !== "string") return "";
   for (const tag of HIKVISION_PERSON_NAME_KEYS) {
@@ -196,78 +315,44 @@ function extractXmlPayload(buffer, contentType) {
  * Hikvision HTTP monitoring tanasi → AccessControl hodisalari ro‘yxati + qurilma IP.
  */
 export function parseHikvisionHttpPayload(buffer, contentType) {
-  const text = extractXmlPayload(buffer, contentType).trim();
+  const ct = String(contentType || "");
   const out = { deviceIp: "", events: [] };
 
+  if (/multipart\/form-data/i.test(ct) && Buffer.isBuffer(buffer)) {
+    const fieldNames = ["AccessControllerEvent", "AccessControlEvent", "EventNotificationAlert"];
+    for (const fieldName of fieldNames) {
+      const partBody = extractMultipartPartByFieldName(buffer, ct, fieldName);
+      if (!partBody || partBody.length === 0) continue;
+      const txt = partBody.toString("utf8").trim();
+      if (!txt) continue;
+      if (txt.startsWith("{") || txt.startsWith("[")) {
+        try {
+          appendEventsFromHikvisionJson(JSON.parse(txt), out);
+          if (out.events.length > 0 || out.deviceIp) return out;
+        } catch {
+          /* boshqa qism yoki XML */
+        }
+      }
+      if (
+        txt.includes("<") &&
+        (/AccessControl/i.test(txt) || /EventNotification/i.test(txt) || /<\?xml/i.test(txt))
+      ) {
+        const nested = parseHikvisionHttpPayload(Buffer.from(txt, "utf8"), "application/xml");
+        if (nested.events.length > 0 || nested.deviceIp) {
+          if (nested.deviceIp) out.deviceIp = nested.deviceIp;
+          out.events.push(...nested.events);
+          return out;
+        }
+      }
+    }
+  }
+
+  const text = Buffer.isBuffer(buffer) ? extractXmlPayload(buffer, contentType).trim() : String(buffer).trim();
   if (!text) return out;
 
   if (text.startsWith("{") || text.startsWith("[")) {
     try {
-      const j = JSON.parse(text);
-      const root = Array.isArray(j) ? j[0] : j;
-      out.deviceIp =
-        root?.ipAddress ||
-        root?.deviceIP ||
-        root?.IpAddress ||
-        root?.AccessControlEvent?.ipAddress ||
-        "";
-      const ac = root?.AccessControlEvent || root?.accessControlEvent || root;
-      if (ac && typeof ac === "object") {
-        const picRaw =
-          ac.picture ??
-          ac.Picture ??
-          ac.SNAPPicture ??
-          ac.snapPicture ??
-          ac.faceSnap ??
-          ac.pictureData;
-        const picNorm = picRaw != null ? normalizeEventSnapshot(picRaw) : "";
-        const pathRaw =
-          ac.pictureURL ??
-          ac.PictureURL ??
-          ac.pictureUrl ??
-          ac.PictureUrl ??
-          ac.snapPictureURL ??
-          ac.SnapPictureURL;
-        const pathNorm = pathRaw != null ? String(pathRaw).trim() : "";
-        const ev = {
-          employeeNoString: ac.employeeNoString ?? ac.employeeNo,
-          employeeNo: ac.employeeNo,
-          cardNo: ac.cardNo,
-          time: ac.time ?? ac.dateTime ?? root?.dateTime,
-          major: ac.major ?? root?.major,
-          minor: ac.minor ?? root?.minor,
-        };
-        const displayName = personNameFromAccessControl(ac);
-        if (displayName) ev.name = displayName;
-        const hintKeys = [
-          "attendanceState",
-          "AttendanceState",
-          "accessType",
-          "AccessType",
-          "direction",
-          "eventType",
-          "subEventType",
-          "currentEventType",
-          "accessChannel",
-          "label",
-        ];
-        for (const k of hintKeys) {
-          if (ac[k] != null && String(ac[k]).trim()) ev[k] = String(ac[k]).trim();
-        }
-        if (picNorm) ev.picture = picNorm;
-        if (pathNorm) {
-          if (/^https?:\/\//i.test(pathNorm)) {
-            try {
-              ev.pictureURL = cleanTerminalImagePath(new URL(pathNorm).pathname);
-            } catch {
-              /* ignore */
-            }
-          } else if (pathNorm.startsWith("/") || /LOCALS/i.test(pathNorm)) {
-            ev.pictureURL = cleanTerminalImagePath(pathNorm);
-          }
-        }
-        out.events.push(ev);
-      }
+      appendEventsFromHikvisionJson(JSON.parse(text), out);
     } catch {
       /* ignore */
     }
