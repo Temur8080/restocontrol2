@@ -13,6 +13,10 @@ import { syncEmployeesFromTerminal, startTerminalEventPoller } from "./terminalI
 import { createAttendanceBroadcaster } from "./realtime.js";
 import { setAttendanceBroadcastHub } from "./attendanceBroadcastHub.js";
 import { handleHikvisionHttpEvent } from "./hikvisionHttpIngest.js";
+import {
+  webhookIpAllowlistMiddleware,
+  webhookRateLimitMiddleware,
+} from "./webhookGuards.js";
 import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.js";
 import { batchDownloadPendingAttendanceSnapshots } from "./attendanceFaceImages.js";
 
@@ -39,10 +43,22 @@ if (String(process.env.TRUST_PROXY || "").trim() === "1") {
   app.set("trust proxy", 1);
 }
 
-/** Hikvision «HTTP monitoring»: URL /api/hikvision/event, port 8000 (JWT emas, ixtiyoriy HIKVISION_HTTP_SECRET). */
+/**
+ * Hikvision «HTTP monitoring»: POST /api/hikvision/event (JWT emas).
+ * Tanani express.raw bilan o‘qiyapmiz (multipart + noto‘g‘ri Content-Type uchun); bodyParser/multer ishlatilmaydi.
+ * WEBHOOK_ALLOWED_IPS / WEBHOOK_MAX_PER_MINUTE — ixtiyoriy (.env.example).
+ */
 app.post(
   "/api/hikvision/event",
-  express.raw({ type: () => true, limit: "4mb" }),
+  webhookIpAllowlistMiddleware,
+  webhookRateLimitMiddleware,
+  express.raw({
+    type: () => true,
+    limit: "10mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
   async (req, res) => {
     try {
       const { status, body } = await handleHikvisionHttpEvent(req, pool);
@@ -919,20 +935,30 @@ api.post("/terminals/sync-all-my-employees", async (req, res) => {
     }
     const adminId = req.auth.sub;
     const { rows } = await pool.query(
-      `SELECT id, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE admin_id = $1 ORDER BY id`,
+      `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE admin_id = $1 ORDER BY id`,
       [adminId]
     );
     let created = 0;
     let updated = 0;
     let totalUsers = 0;
+    let scannedTotal = 0;
+    let pagesTotal = 0;
+    let enrichedTotal = 0;
     const details = [];
     for (const t of rows) {
       const r = await syncEmployeesFromTerminal(pool, t);
-      details.push({ terminalId: t.id, ...r });
+      details.push({
+        terminalId: t.id,
+        terminalName: t.terminal_name ?? null,
+        ...r,
+      });
       if (r.ok) {
         created += r.created;
         updated += r.updated;
         totalUsers += r.total;
+        scannedTotal += Number(r.scanned) || 0;
+        pagesTotal += Number(r.pages) || 0;
+        enrichedTotal += Number(r.enriched) || 0;
       }
     }
     res.json({
@@ -941,6 +967,9 @@ api.post("/terminals/sync-all-my-employees", async (req, res) => {
       created,
       updated,
       totalDeviceUsers: totalUsers,
+      scannedTotal,
+      pagesTotal,
+      enrichedTotal,
       details,
     });
   } catch (err) {

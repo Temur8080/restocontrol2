@@ -28,6 +28,7 @@ import {
   RotateCcw,
   Wifi,
   Download,
+  Loader2,
   Monitor,
   Users,
   Wallet,
@@ -922,6 +923,7 @@ function App() {
   });
   const [terminalProbeOpen, setTerminalProbeOpen] = useState(false);
   const [terminalProbeBusy, setTerminalProbeBusy] = useState(false);
+  const [terminalProbeTargetId, setTerminalProbeTargetId] = useState(null);
   const [terminalProbeName, setTerminalProbeName] = useState("");
   const [terminalProbeResult, setTerminalProbeResult] = useState(null);
   const [terminalSyncBusy, setTerminalSyncBusy] = useState(false);
@@ -3205,6 +3207,7 @@ function App() {
 
   async function runTerminalConnectionTest(row) {
     if (!row?.id) return;
+    setTerminalProbeTargetId(row.id);
     setTerminalProbeName(String(row.terminal_name || "").trim() || `#${row.id}`);
     setTerminalProbeResult(null);
     setTerminalProbeOpen(true);
@@ -3227,6 +3230,7 @@ function App() {
   function closeTerminalProbeModal() {
     setTerminalProbeOpen(false);
     setTerminalProbeBusy(false);
+    setTerminalProbeTargetId(null);
     setTerminalProbeResult(null);
     setTerminalProbeName("");
   }
@@ -3248,6 +3252,9 @@ function App() {
           created: r.created ?? 0,
           updated: r.updated ?? 0,
           terminals: r.terminalCount ?? 0,
+          scanned: r.scannedTotal ?? 0,
+          pages: r.pagesTotal ?? 0,
+          enriched: r.enrichedTotal ?? 0,
         })
       );
     } catch (err) {
@@ -3262,11 +3269,18 @@ function App() {
     setTerminalTableSyncBusyId(row.id);
     try {
       const r = await api.syncTerminalEmployees(row.id);
+      const d = await api.bootstrap();
+      if (d?.employees) {
+        setEmployees(Array.isArray(d.employees) ? d.employees.map(migrateEmployeeSchedule) : []);
+      }
       window.alert(
         t("employees.terminalSyncSummarySingle", {
           created: r.created ?? 0,
           updated: r.updated ?? 0,
           total: r.total ?? 0,
+          scanned: r.scanned ?? 0,
+          pages: r.pages ?? 0,
+          enriched: r.enriched ?? 0,
         })
       );
     } catch (err) {
@@ -3451,14 +3465,19 @@ function App() {
                   </button>
                   {userRole === "admin" ? (
                     <button
-                      className="add-icon-btn"
+                      className="employees-toolbar-sync-btn"
                       type="button"
-                      disabled={terminalSyncBusy}
+                      disabled={terminalSyncBusy || terminalTableSyncBusyId != null}
                       onClick={() => pullEmployeesFromTerminals()}
                       aria-label={t("employees.terminalSyncAria")}
                       title={t("employees.terminalSyncTitle")}
                     >
-                      <Download size={15} strokeWidth={2} />
+                      {terminalSyncBusy ? (
+                        <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
+                      ) : (
+                        <Download size={15} strokeWidth={2} aria-hidden />
+                      )}
+                      <span>{t("terminal.syncAllShort")}</span>
                     </button>
                   ) : null}
                   <select
@@ -4070,14 +4089,33 @@ function App() {
             <section className="table-wrap journal-wrap scroll-modern">
               <div className="journal-top-row">
                 <h3 className="journal-title">{t("terminal.pageTitle")}</h3>
-                <button
-                  type="button"
-                  className="module-right-btn"
-                  aria-label={t("terminal.addAria")}
-                  onClick={openCreateTerminalModal}
-                >
-                  <Plus size={14} strokeWidth={2} />
-                </button>
+                <div className="terminal-page-toolbar-btns">
+                  {userRole === "admin" ? (
+                    <button
+                      type="button"
+                      className="terminal-toolbar-sync-btn"
+                      aria-label={t("terminal.syncAllEmployeesAria")}
+                      title={t("terminal.syncAllEmployeesTitle")}
+                      disabled={terminalSyncBusy || terminalTableSyncBusyId != null}
+                      onClick={() => pullEmployeesFromTerminals()}
+                    >
+                      {terminalSyncBusy ? (
+                        <Loader2 size={14} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
+                      ) : (
+                        <Download size={14} strokeWidth={2} aria-hidden />
+                      )}
+                      <span>{t("terminal.syncAllShort")}</span>
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="module-right-btn"
+                    aria-label={t("terminal.addAria")}
+                    onClick={openCreateTerminalModal}
+                  >
+                    <Plus size={14} strokeWidth={2} />
+                  </button>
+                </div>
               </div>
 
               {terminalsError ? <p className="login-err">{terminalsError}</p> : null}
@@ -4109,23 +4147,35 @@ function App() {
                           <div className="terminal-actions-cell">
                             <button
                               type="button"
-                              className="add-icon-btn"
+                              className="terminal-row-action-btn"
                               aria-label={t("terminal.testConnectionAria")}
                               title={t("terminal.testConnection")}
-                              disabled={terminalProbeBusy || terminalTableSyncBusyId != null}
+                              disabled={terminalProbeBusy}
                               onClick={() => runTerminalConnectionTest(row)}
                             >
-                              <Wifi size={15} strokeWidth={2} />
+                              {terminalProbeBusy && terminalProbeTargetId === row.id ? (
+                                <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
+                              ) : (
+                                <Wifi size={15} strokeWidth={2} aria-hidden />
+                              )}
+                              <span>{t("terminal.actionProbeShort")}</span>
                             </button>
                             <button
                               type="button"
-                              className="add-icon-btn"
+                              className="terminal-row-action-btn terminal-row-action-btn--sync"
                               aria-label={t("terminal.syncEmployeesAria")}
                               title={t("terminal.syncEmployees")}
-                              disabled={terminalProbeBusy || terminalTableSyncBusyId === row.id}
+                              disabled={
+                                terminalProbeBusy || terminalSyncBusy || terminalTableSyncBusyId === row.id
+                              }
                               onClick={() => syncTerminalEmployeesFromTable(row)}
                             >
-                              <Download size={15} strokeWidth={2} />
+                              {terminalTableSyncBusyId === row.id ? (
+                                <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
+                              ) : (
+                                <Download size={15} strokeWidth={2} aria-hidden />
+                              )}
+                              <span>{t("terminal.actionSyncShort")}</span>
                             </button>
                           </div>
                         </td>
@@ -6875,15 +6925,41 @@ function App() {
                   ) : null}
                   <ul className="terminal-probe-steps">
                     {(terminalProbeResult.steps || []).map((s) => (
-                      <li key={s.id} className={`terminal-probe-step ${s.ok ? "terminal-probe-step-ok" : "terminal-probe-step-fail"}`}>
+                      <li
+                        key={s.id}
+                        className={`terminal-probe-step ${
+                          s.ok ? "terminal-probe-step-ok" : s.optional ? "terminal-probe-step-warn" : "terminal-probe-step-fail"
+                        }`}
+                      >
                         <div className="terminal-probe-step-title">
+                          {s.id === "deviceInfo" ? t("terminal.probeStepDevice") : null}
+                          {s.id === "systemTime" ? t("terminal.probeStepTime") : null}
+                          {s.id === "accessControlCap" ? t("terminal.probeStepAcCap") : null}
                           {s.id === "userInfoSearch" ? t("terminal.probeStepUser") : null}
+                          {s.id === "userInfoRecord" ? t("terminal.probeStepUserRecord") : null}
                           {s.id === "acsEvent" ? t("terminal.probeStepEvents") : null}
-                          {!["userInfoSearch", "acsEvent"].includes(s.id) ? s.id : null}
+                          {!["deviceInfo", "systemTime", "accessControlCap", "userInfoSearch", "userInfoRecord", "acsEvent"].includes(
+                            s.id
+                          )
+                            ? s.id
+                            : null}
+                          {s.optional ? (
+                            <span className="terminal-probe-optional-badge">{t("terminal.probeOptional")}</span>
+                          ) : null}
                         </div>
                         <div className="terminal-probe-step-meta">
                           {t("terminal.probeHttp", { status: s.httpStatus ?? "—" })}
-                          {s.userCount != null ? (
+                          {s.id === "userInfoSearch" && s.userCount != null && s.userScanned != null ? (
+                            <span className="terminal-probe-step-count">
+                              {" · "}
+                              {t("terminal.probeUserSearchStats", {
+                                named: s.userCount,
+                                scanned: s.userScanned,
+                                pages: s.searchPages ?? 1,
+                                enriched: s.recordEnriched ?? 0,
+                              })}
+                            </span>
+                          ) : s.userCount != null ? (
                             <span className="terminal-probe-step-count">
                               {" · "}
                               {t("terminal.probeUsersFound", { n: s.userCount })}
@@ -6901,7 +6977,12 @@ function App() {
                     ))}
                   </ul>
                   {terminalProbeResult.ok ? (
-                    <p className="salary-hint terminal-probe-summary-ok">{t("terminal.probeSuccess")}</p>
+                    <>
+                      <p className="salary-hint terminal-probe-summary-ok">{t("terminal.probeSuccess")}</p>
+                      {terminalProbeResult.optionalFailed ? (
+                        <p className="salary-hint terminal-probe-optional-note">{t("terminal.probeSuccessOptionalNote")}</p>
+                      ) : null}
+                    </>
                   ) : (terminalProbeResult.steps || []).length > 0 ? (
                     <p className="login-err terminal-probe-summary-fail">{t("terminal.probePartial")}</p>
                   ) : null}

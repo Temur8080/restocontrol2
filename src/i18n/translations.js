@@ -231,8 +231,9 @@ export const translations = {
       terminalSyncTitle: "Terminaldan hodimlarni yuklash",
       terminalSyncAria: "Barcha terminallardan hodimlar ro‘yxatini sinxronlash",
       terminalSyncSummary:
-        "Sinxron: {terminals} ta terminal. Yangi hodimlar: {created}, yangilangan: {updated}.",
-      terminalSyncSummarySingle: "Yangi: {created}, yangilangan: {updated}. Qurilmada: {total} kishi.",
+        "Sinxron: {terminals} ta terminal. Yangi: {created}, yangilangan: {updated}. Skan: {scanned} yozuv ({pages} ISAPI so‘rov), qo‘shimcha Record: {enriched} ism.",
+      terminalSyncSummarySingle:
+        "Skan: {scanned} yozuv ({pages} so‘rov). Ismli import: {total}. Yangi: {created}, yangilangan: {updated}. Record bilan aniqlangan: {enriched}.",
     },
     salary: {
       rateKind: {
@@ -352,8 +353,21 @@ export const translations = {
       probeSuccess: "Aloqa muvaffaqiyatli: ikkala ISAPI so‘rovi ham muvaffaqiyatli.",
       probePartial: "Aloqa qisman: ba’zi qadamlar muvaffaqiyatsiz (tafsilotlar pastda).",
       probeClose: "Yopish",
-      syncEmployees: "Hodimlarni terminaldan yuklash",
-      syncEmployeesAria: "Qurilmadan foydalanuvchilarni ilovaga sinxronlash",
+      syncEmployees: "Shu terminaldan yuklash",
+      syncEmployeesAria: "Faqat shu qurilmadan foydalanuvchilarni chuqur qidirib bazaga yozish",
+      syncAllEmployeesTitle: "Barcha terminallardan hodimlarni yuklash",
+      syncAllEmployeesAria: "Barcha qurilmalardan ISAPI orqali ro‘yxatni sahifalab o‘qib sinxronlash",
+      syncAllShort: "Barcha terminal",
+      actionProbeShort: "Chuqur tekshiruv",
+      actionSyncShort: "Hodimlarni yuklash",
+      probeStepDevice: "Qurilma (System/deviceInfo)",
+      probeStepTime: "Vaqt (System/time)",
+      probeStepAcCap: "Kirish nazorati (capabilities)",
+      probeStepUserRecord: "Foydalanuvchi kartasi (UserInfo/Record)",
+      probeOptional: "ixtiyoriy",
+      probeSuccessOptionalNote:
+        "Asosiy ISAPI ishlayapti. Ba’zi ixtiyoriy qadamlar (model ma’lumoti, capabilities va hok.) muvaffaqiyatsiz bo‘lishi mumkin — qurilma firmwareiga bog‘liq.",
+      probeUserSearchStats: "{named} ta ism importga · skan {scanned} · {pages} so‘rov · Record {enriched}",
     },
     editEmployee: {
       title: "Hodimni tahrirlash",
@@ -714,8 +728,9 @@ export const translations = {
       terminalSyncTitle: "Загрузить сотрудников с терминалов",
       terminalSyncAria: "Синхронизировать список со всех терминалов",
       terminalSyncSummary:
-        "Синхронизация: {terminals} терминал(ов). Новых: {created}, обновлено: {updated}.",
-      terminalSyncSummarySingle: "Новых: {created}, обновлено: {updated}. На устройстве: {total}.",
+        "Синхронизация: {terminals} терминал(ов). Новых: {created}, обновлено: {updated}. Скан: {scanned} записей ({pages} запросов ISAPI), уточнение Record: {enriched} имён.",
+      terminalSyncSummarySingle:
+        "Скан: {scanned} записей ({pages} запросов). С именами для импорта: {total}. Новых: {created}, обновлено: {updated}. Через Record: {enriched}.",
     },
     salary: {
       rateKind: {
@@ -835,8 +850,21 @@ export const translations = {
       probeSuccess: "Связь успешна: оба запроса ISAPI выполнены.",
       probePartial: "Связь частичная: некоторые шаги не удались (см. ниже).",
       probeClose: "Закрыть",
-      syncEmployees: "Загрузить сотрудников с терминала",
-      syncEmployeesAria: "Синхронизировать пользователей устройства в приложение",
+      syncEmployees: "С этого терминала",
+      syncEmployeesAria: "Глубокий поиск пользователей только на этом устройстве",
+      syncAllEmployeesTitle: "Загрузить со всех терминалов",
+      syncAllEmployeesAria: "Синхронизация: постраничный ISAPI со всех устройств",
+      syncAllShort: "Все терминалы",
+      actionProbeShort: "Глубокая проверка",
+      actionSyncShort: "Загрузить людей",
+      probeStepDevice: "Устройство (System/deviceInfo)",
+      probeStepTime: "Время (System/time)",
+      probeStepAcCap: "Контроль доступа (capabilities)",
+      probeStepUserRecord: "Карточка пользователя (UserInfo/Record)",
+      probeOptional: "опц.",
+      probeSuccessOptionalNote:
+        "Основной ISAPI работает. Некоторые опциональные шаги могут не пройти из‑за прошивки — это не всегда ошибка.",
+      probeUserSearchStats: "{named} имён · скан {scanned} · {pages} запросов · Record {enriched}",
     },
     editEmployee: {
       title: "Редактировать сотрудника",
@@ -1197,8 +1225,9 @@ export const translations = {
       terminalSyncTitle: "Pull employees from terminals",
       terminalSyncAria: "Sync employee list from all your terminals",
       terminalSyncSummary:
-        "Synced {terminals} terminal(s). New: {created}, updated: {updated}.",
-      terminalSyncSummarySingle: "New: {created}, updated: {updated}. On device: {total} people.",
+        "Synced {terminals} terminal(s). New: {created}, updated: {updated}. Scanned {scanned} rows ({pages} ISAPI calls), Record enrich: {enriched} names.",
+      terminalSyncSummarySingle:
+        "Scanned {scanned} rows ({pages} calls). With names for import: {total}. New: {created}, updated: {updated}. Record enriched: {enriched}.",
     },
     salary: {
       rateKind: {
@@ -1318,8 +1347,21 @@ export const translations = {
       probeSuccess: "Connection OK: both ISAPI calls succeeded.",
       probePartial: "Partial: some steps failed (see below).",
       probeClose: "Close",
-      syncEmployees: "Sync employees from terminal",
-      syncEmployeesAria: "Import device users into the app",
+      syncEmployees: "From this terminal",
+      syncEmployeesAria: "Deep query users on this device only",
+      syncAllEmployeesTitle: "Pull from all terminals",
+      syncAllEmployeesAria: "Page through ISAPI on every terminal and sync",
+      syncAllShort: "All terminals",
+      actionProbeShort: "Deep check",
+      actionSyncShort: "Sync staff",
+      probeStepDevice: "Device (System/deviceInfo)",
+      probeStepTime: "Time (System/time)",
+      probeStepAcCap: "Access control (capabilities)",
+      probeStepUserRecord: "User card (UserInfo/Record)",
+      probeOptional: "opt.",
+      probeSuccessOptionalNote:
+        "Core ISAPI checks passed. Optional steps may fail depending on firmware — not always a problem.",
+      probeUserSearchStats: "{named} names · scanned {scanned} · {pages} requests · Record {enriched}",
     },
     editEmployee: {
       title: "Edit employee",

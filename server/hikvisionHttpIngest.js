@@ -4,23 +4,18 @@ import { normalizeEventSnapshot } from "./eventSnapshot.js";
 import { cleanTerminalImagePath } from "./hikvisionImageDownload.js";
 import { directionHintFromEvents, isCheckoutTerminalType } from "./hikvisionAccessDirection.js";
 import { HIKVISION_PERSON_NAME_KEYS } from "./terminalHikvision.js";
+import { getWebhookClientIp, normalizeDeviceHost } from "./webhookGuards.js";
 
-function normalizeDeviceHost(raw) {
-  if (raw == null) return "";
-  let s = String(raw).trim();
-  if (!s) return "";
-  s = s.replace(/^https?:\/\//i, "");
-  s = s.split("/")[0];
-  s = s.split(":")[0];
-  s = s.replace(/^::ffff:/i, "");
-  return s.toLowerCase();
-}
-
-function getClientIp(req) {
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) return normalizeDeviceHost(String(xff).split(",")[0]);
-  const ra = req.socket?.remoteAddress || "";
-  return normalizeDeviceHost(ra);
+/** Hikvision «HTTP monitoring» yurak urishi — tahlil qilmay tez 200 OK. */
+function bufferLooksLikeHeartbeat(buf) {
+  const n = Math.min(buf.length, 16384);
+  if (n === 0) return false;
+  const s = buf.subarray(0, n).toString("utf8");
+  if (!/heartBeat|heartbeat/i.test(s)) return false;
+  if (/["']heartBeat["']\s*:\s*true/i.test(s)) return true;
+  if (/heartBeat\s*[=:]\s*true/i.test(s)) return true;
+  if (/"active"\s*:\s*1/i.test(s) && /heartbeat/i.test(s)) return true;
+  return false;
 }
 
 function xmlTagInner(xml, tag) {
@@ -92,10 +87,63 @@ function extractPictureFromAccessControlXml(block) {
 
 /** multipart qism: sarlavha / tana chegarasi (\r\n yoki ba'zan faqat \n). */
 function mimePartHeaderBodySplit(part) {
+  if (!Buffer.isBuffer(part) || part.length === 0) return null;
   const crlf = part.indexOf(Buffer.from("\r\n\r\n"));
   if (crlf >= 0) return { headerLen: crlf, bodyStart: crlf + 4 };
   const lf = part.indexOf(Buffer.from("\n\n"));
   if (lf >= 0) return { headerLen: lf, bodyStart: lf + 2 };
+
+  /* Hikvision ba'zan ikki bo'sh qator o'rniga bitta CRLF/LF qo'yadi (noto'g'ri multipart). */
+  const scanLen = Math.min(part.length, 65536);
+  const s = part.toString("latin1", 0, scanLen);
+  const m1 = s.match(/\r\n(?=(?:\s|\u00a0|\ufeff)*[\[{])/m);
+  const m2 =
+    !m1 && s.length > 0
+      ? s.match(/\n(?=(?:\s|\u00a0|\ufeff)*[\[{])/m)
+      : null;
+  const m = m1 || m2;
+  if (m && m.index !== undefined) {
+    return { headerLen: m.index, bodyStart: m.index + m[0].length };
+  }
+  return null;
+}
+
+/**
+ * JSON ajratish: ba'zi Hikvision qurilmalar qism Content-Length noto‘g‘ri beradi,
+ * tana oxirida boundary oldidan ortiqcha bayt bo‘lishi mumkin — qattiq kesish `}` yo‘qoladi.
+ */
+function tryParseJsonLenient(raw) {
+  let t = String(raw ?? "").trim();
+  if (t.charCodeAt(0) === 0xfeff) t = t.slice(1).trim();
+  if (!t) return null;
+  const tryParse = (s) => {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return null;
+    }
+  };
+  let p = tryParse(t);
+  if (p != null) return p;
+  const iObj = t.indexOf("{");
+  const iArr = t.indexOf("[");
+  const preferArr = iArr >= 0 && (iObj < 0 || iArr < iObj);
+  if (preferArr && iArr >= 0) {
+    let j = t.lastIndexOf("]");
+    while (j > iArr) {
+      p = tryParse(t.slice(iArr, j + 1));
+      if (p != null) return p;
+      j = t.lastIndexOf("]", j - 1);
+    }
+  }
+  if (iObj >= 0) {
+    let j = t.lastIndexOf("}");
+    while (j > iObj) {
+      p = tryParse(t.slice(iObj, j + 1));
+      if (p != null) return p;
+      j = t.lastIndexOf("}", j - 1);
+    }
+  }
   return null;
 }
 
@@ -173,13 +221,6 @@ function extractMultipartPartByFieldName(buffer, contentType, fieldName) {
       continue;
     }
     let body = part.subarray(split.bodyStart);
-    const clMatch = headers.match(/content-length:\s*(\d+)/i);
-    if (clMatch) {
-      const n = Number.parseInt(clMatch[1], 10);
-      if (Number.isFinite(n) && n >= 0 && n <= body.length) {
-        body = body.subarray(0, n);
-      }
-    }
     while (
       body.length >= 2 &&
       body[body.length - 2] === 0x0d &&
@@ -228,13 +269,6 @@ function listMultipartParts(buffer, contentType) {
     const nameMatch = headers.match(/name\s*=\s*"([^"]+)"/i) || headers.match(/name\s*=\s*([^;\r\n]+)/i);
     const fn = nameMatch ? String(nameMatch[1] || nameMatch[2]).trim().replace(/^"|"$/g, "") : "";
     let body = part.subarray(split.bodyStart);
-    const clMatch = headers.match(/content-length:\s*(\d+)/i);
-    if (clMatch) {
-      const n = Number.parseInt(clMatch[1], 10);
-      if (Number.isFinite(n) && n >= 0 && n <= body.length) {
-        body = body.subarray(0, n);
-      }
-    }
     while (
       body.length >= 2 &&
       body[body.length - 2] === 0x0d &&
@@ -266,25 +300,7 @@ function tryProcessPayloadString(txt, out) {
   const evBefore = out.events.length;
   const dipBefore = out.deviceIp;
 
-  let parsed = null;
-  if (s.startsWith("{") || s.startsWith("[")) {
-    try {
-      parsed = JSON.parse(s);
-    } catch {
-      parsed = null;
-    }
-  }
-  if (!parsed && s.includes("{")) {
-    const i = s.indexOf("{");
-    const j = s.lastIndexOf("}");
-    if (i >= 0 && j > i) {
-      try {
-        parsed = JSON.parse(s.slice(i, j + 1));
-      } catch {
-        parsed = null;
-      }
-    }
-  }
+  const parsed = tryParseJsonLenient(s);
   if (parsed) {
     try {
       appendEventsFromHikvisionJson(parsed, out);
@@ -318,15 +334,8 @@ function resolveHikvisionAcSubobject(root) {
     root.accessControllerEvent;
   if (raw == null) return root;
   if (typeof raw === "string") {
-    const t = raw.trim();
-    if (t.startsWith("{") || t.startsWith("[")) {
-      try {
-        const p = JSON.parse(t);
-        if (p && typeof p === "object") return p;
-      } catch {
-        /* ignore */
-      }
-    }
+    const p = tryParseJsonLenient(raw);
+    if (p && typeof p === "object") return p;
     return root;
   }
   if (typeof raw === "object") return raw;
@@ -503,10 +512,13 @@ export function parseHikvisionHttpPayload(buffer, contentType) {
   if (!text) return out;
 
   if (text.startsWith("{") || text.startsWith("[")) {
-    try {
-      appendEventsFromHikvisionJson(JSON.parse(text), out);
-    } catch {
-      /* ignore */
+    const j = tryParseJsonLenient(text);
+    if (j) {
+      try {
+        appendEventsFromHikvisionJson(j, out);
+      } catch {
+        /* ignore */
+      }
     }
     return out;
   }
@@ -617,6 +629,17 @@ export async function handleHikvisionHttpEvent(req, pool) {
 
   const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body || ""), "utf8");
   const ct = req.get("content-type") || "";
+  const clientIp = getWebhookClientIp(req);
+
+  if (bufferLooksLikeHeartbeat(buf)) {
+    console.log(`[hikvision http] heartBeat → 200 OK (ip="${clientIp}", tana=${buf.length}b)`);
+    return { status: 200, body: "OK" };
+  }
+
+  console.log(
+    `[hikvision http] keldi: tana=${buf.length}b, ct="${String(ct).slice(0, 100)}", ip="${clientIp}"`
+  );
+
   const parsed = parseHikvisionHttpPayload(buf, ct);
   const multiPic = firstJpegDataUrlFromMultipart(buf, ct);
   if (multiPic) {
@@ -625,14 +648,13 @@ export async function handleHikvisionHttpEvent(req, pool) {
       break;
     }
   }
-  const clientIp = getClientIp(req);
   const deviceIp = parsed.deviceIp || "";
 
   const terminalIdParam = req.query?.terminalId ?? req.query?.terminal ?? "";
 
   const nEv = parsed.events.length;
   console.log(
-    `[hikvision http] qabul: hodisalar=${nEv}, deviceIp="${deviceIp || "—"}", ulanish_ip="${clientIp || "—"}"` +
+    `[hikvision http] qabul: hodisalar=${nEv}, deviceIp="${deviceIp || "—"}", ulanish_ip="${clientIp}"` +
       (terminalIdParam ? `, terminalId_param=${terminalIdParam}` : "")
   );
 

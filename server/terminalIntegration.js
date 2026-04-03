@@ -4,6 +4,7 @@ import {
   fetchHikvisionEvents,
   eventTimeIso,
   eventDedupeKey,
+  eventEmployeeKey,
   eventEmployeeName,
   normalizeEmployeeEventName,
   deviceEventDateTimeWithTargetOffset,
@@ -53,9 +54,20 @@ async function getDefaultFilialForAdmin(pool, adminId) {
  */
 export async function syncEmployeesFromTerminal(pool, terminalRow) {
   const norm = normalizeTerminalBaseUrl(terminalRow.ip_address);
-  if (norm.error) return { ok: false, error: norm.error, created: 0, updated: 0, total: 0 };
+  if (norm.error) {
+    return {
+      ok: false,
+      error: norm.error,
+      created: 0,
+      updated: 0,
+      total: 0,
+      scanned: 0,
+      pages: 0,
+      enriched: 0,
+    };
+  }
 
-  const { users, ok, error } = await fetchHikvisionUsers(
+  const { users, ok, error, meta } = await fetchHikvisionUsers(
     norm.baseUrl,
     terminalRow.login,
     terminalRow.password,
@@ -72,11 +84,31 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     } catch {
       /* ignore */
     }
-    return { ok: false, error: errMsg, created: 0, updated: 0, total: 0 };
+    return {
+      ok: false,
+      error: errMsg,
+      created: 0,
+      updated: 0,
+      total: 0,
+      scanned: 0,
+      pages: 0,
+      enriched: 0,
+    };
   }
 
   const adminId = Number(terminalRow.admin_id);
-  if (!Number.isFinite(adminId)) return { ok: false, error: "Admin id yo'q", created: 0, updated: 0, total: 0 };
+  if (!Number.isFinite(adminId)) {
+    return {
+      ok: false,
+      error: "Admin id yo'q",
+      created: 0,
+      updated: 0,
+      total: 0,
+      scanned: 0,
+      pages: 0,
+      enriched: 0,
+    };
+  }
 
   const defaultFilial = await getDefaultFilialForAdmin(pool, adminId);
   let created = 0;
@@ -112,7 +144,16 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     created += 1;
   }
 
-  return { ok: true, error: null, created, updated, total: users.length };
+  return {
+    ok: true,
+    error: null,
+    created,
+    updated,
+    total: users.length,
+    scanned: meta?.listedRaw ?? users.length,
+    pages: meta?.pages ?? 1,
+    enriched: meta?.enriched ?? 0,
+  };
 }
 
 async function getCursor(pool, terminalId) {
