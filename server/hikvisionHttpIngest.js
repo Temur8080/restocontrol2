@@ -90,6 +90,15 @@ function extractPictureFromAccessControlXml(block) {
   return "";
 }
 
+/** multipart qism: sarlavha / tana chegarasi (\r\n yoki ba'zan faqat \n). */
+function mimePartHeaderBodySplit(part) {
+  const crlf = part.indexOf(Buffer.from("\r\n\r\n"));
+  if (crlf >= 0) return { headerLen: crlf, bodyStart: crlf + 4 };
+  const lf = part.indexOf(Buffer.from("\n\n"));
+  if (lf >= 0) return { headerLen: lf, bodyStart: lf + 2 };
+  return null;
+}
+
 /** Multipart tanadan birinchi JPEG qismi → data URL. */
 function firstJpegDataUrlFromMultipart(buf, contentType) {
   const ct = String(contentType || "");
@@ -104,10 +113,10 @@ function firstJpegDataUrlFromMultipart(buf, contentType) {
     const next = buf.indexOf(boundary, i + boundary.length);
     const partEnd = next < 0 ? buf.length : next;
     const part = buf.subarray(i + boundary.length, partEnd);
-    const headerEnd = part.indexOf(Buffer.from("\r\n\r\n"));
-    if (headerEnd > 0) {
-      const headers = part.subarray(0, headerEnd).toString("latin1").toLowerCase();
-      const body = part.subarray(headerEnd + 4);
+    const split = mimePartHeaderBodySplit(part);
+    if (split && split.headerLen >= 0) {
+      const headers = part.subarray(0, split.headerLen).toString("latin1").toLowerCase();
+      const body = part.subarray(split.bodyStart);
       if (
         (headers.includes("image/jpeg") || headers.includes("image/jpg")) &&
         body.length > 500 &&
@@ -151,19 +160,26 @@ function extractMultipartPartByFieldName(buffer, contentType, fieldName) {
     const nextBoundary = buffer.indexOf(delimiter, partBegin);
     const partEnd = nextBoundary < 0 ? buffer.length : nextBoundary;
     const part = buffer.subarray(partBegin, partEnd);
-    const headerSep = part.indexOf(Buffer.from("\r\n\r\n"));
-    if (headerSep < 0) {
+    const split = mimePartHeaderBodySplit(part);
+    if (!split) {
       offset = idx + delimiter.length;
       continue;
     }
-    const headers = part.subarray(0, headerSep).toString("latin1");
+    const headers = part.subarray(0, split.headerLen).toString("latin1");
     const nameMatch = headers.match(/name\s*=\s*"([^"]+)"/i) || headers.match(/name\s*=\s*([^;\r\n]+)/i);
     const fn = nameMatch ? String(nameMatch[1] || nameMatch[2]).trim().replace(/^"|"$/g, "") : "";
     if (fn.toLowerCase() !== want) {
       offset = idx + delimiter.length;
       continue;
     }
-    let body = part.subarray(headerSep + 4);
+    let body = part.subarray(split.bodyStart);
+    const clMatch = headers.match(/content-length:\s*(\d+)/i);
+    if (clMatch) {
+      const n = Number.parseInt(clMatch[1], 10);
+      if (Number.isFinite(n) && n >= 0 && n <= body.length) {
+        body = body.subarray(0, n);
+      }
+    }
     while (
       body.length >= 2 &&
       body[body.length - 2] === 0x0d &&
@@ -203,15 +219,22 @@ function listMultipartParts(buffer, contentType) {
     const nextBoundary = buffer.indexOf(delimiter, partBegin);
     const partEnd = nextBoundary < 0 ? buffer.length : nextBoundary;
     const part = buffer.subarray(partBegin, partEnd);
-    const headerSep = part.indexOf(Buffer.from("\r\n\r\n"));
-    if (headerSep < 0) {
+    const split = mimePartHeaderBodySplit(part);
+    if (!split) {
       offset = idx + delimiter.length;
       continue;
     }
-    const headers = part.subarray(0, headerSep).toString("latin1");
+    const headers = part.subarray(0, split.headerLen).toString("latin1");
     const nameMatch = headers.match(/name\s*=\s*"([^"]+)"/i) || headers.match(/name\s*=\s*([^;\r\n]+)/i);
     const fn = nameMatch ? String(nameMatch[1] || nameMatch[2]).trim().replace(/^"|"$/g, "") : "";
-    let body = part.subarray(headerSep + 4);
+    let body = part.subarray(split.bodyStart);
+    const clMatch = headers.match(/content-length:\s*(\d+)/i);
+    if (clMatch) {
+      const n = Number.parseInt(clMatch[1], 10);
+      if (Number.isFinite(n) && n >= 0 && n <= body.length) {
+        body = body.subarray(0, n);
+      }
+    }
     while (
       body.length >= 2 &&
       body[body.length - 2] === 0x0d &&
@@ -243,9 +266,28 @@ function tryProcessPayloadString(txt, out) {
   const evBefore = out.events.length;
   const dipBefore = out.deviceIp;
 
+  let parsed = null;
   if (s.startsWith("{") || s.startsWith("[")) {
     try {
-      appendEventsFromHikvisionJson(JSON.parse(s), out);
+      parsed = JSON.parse(s);
+    } catch {
+      parsed = null;
+    }
+  }
+  if (!parsed && s.includes("{")) {
+    const i = s.indexOf("{");
+    const j = s.lastIndexOf("}");
+    if (i >= 0 && j > i) {
+      try {
+        parsed = JSON.parse(s.slice(i, j + 1));
+      } catch {
+        parsed = null;
+      }
+    }
+  }
+  if (parsed) {
+    try {
+      appendEventsFromHikvisionJson(parsed, out);
       return out.events.length > evBefore || (!!out.deviceIp && out.deviceIp !== dipBefore);
     } catch {
       return false;
@@ -266,17 +308,48 @@ function tryProcessPayloadString(txt, out) {
   return false;
 }
 
+/** Hikvision: JSON ichida AccessControl / AccessController (Controller!) yozilishlari. */
+function resolveHikvisionAcSubobject(root) {
+  if (!root || typeof root !== "object") return null;
+  const raw =
+    root.AccessControlEvent ??
+    root.accessControlEvent ??
+    root.AccessControllerEvent ??
+    root.accessControllerEvent;
+  if (raw == null) return root;
+  if (typeof raw === "string") {
+    const t = raw.trim();
+    if (t.startsWith("{") || t.startsWith("[")) {
+      try {
+        const p = JSON.parse(t);
+        if (p && typeof p === "object") return p;
+      } catch {
+        /* ignore */
+      }
+    }
+    return root;
+  }
+  if (typeof raw === "object") return raw;
+  return root;
+}
+
 /** Hikvision AccessControl JSON obyektidan hodisa qo‘shadi (HTTP multipart ichidagi JSON). */
 function appendEventsFromHikvisionJson(j, out) {
   const root = Array.isArray(j) ? j[0] : j;
   if (!root || typeof root !== "object") return;
 
-  const dip = root.ipAddress || root.deviceIP || root.IpAddress || root.AccessControlEvent?.ipAddress || "";
+  const dip =
+    root.ipAddress ||
+    root.deviceIP ||
+    root.IpAddress ||
+    root.AccessControlEvent?.ipAddress ||
+    root.AccessControllerEvent?.ipAddress ||
+    "";
   if (dip && String(dip).trim()) {
     if (!out.deviceIp) out.deviceIp = String(dip).trim();
   }
 
-  const ac = root.AccessControlEvent || root.accessControlEvent || root;
+  const ac = resolveHikvisionAcSubobject(root);
   if (!ac || typeof ac !== "object") return;
 
   const picRaw =

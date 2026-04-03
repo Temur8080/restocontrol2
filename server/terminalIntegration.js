@@ -13,6 +13,7 @@ import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.
 import { resolveSnapshotForTerminalEvent } from "./attendanceFaceImages.js";
 import { employeeMatchByNormalizedNameSql } from "./employeeAccessCards.js";
 import { isCheckoutTerminalType, isExitLikeAccessEvent } from "./hikvisionAccessDirection.js";
+import { isPrivateLanHostname } from "./terminalProbe.js";
 
 export function rowToAttendanceRow(row) {
   if (!row) return null;
@@ -60,7 +61,19 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     terminalRow.password,
     DEFAULT_TIMEOUT_MS
   );
-  if (!ok) return { ok: false, error: error || "UserInfo xatosi", created: 0, updated: 0, total: 0 };
+  if (!ok) {
+    let errMsg = error || "UserInfo xatosi";
+    try {
+      const host = new URL(norm.baseUrl).hostname.toLowerCase().replace(/^::ffff:/i, "");
+      if (isPrivateLanHostname(host)) {
+        errMsg +=
+          " Ichki tarmoq manzili: agar server Internetdagi VPS bo‘lsa, bu yerdan ISAPI (hodimlarni yuklash) ishlamaydi — VPN yoki serverni LAN da ishlating.";
+      }
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, error: errMsg, created: 0, updated: 0, total: 0 };
+  }
 
   const adminId = Number(terminalRow.admin_id);
   if (!Number.isFinite(adminId)) return { ok: false, error: "Admin id yo'q", created: 0, updated: 0, total: 0 };

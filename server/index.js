@@ -900,7 +900,8 @@ api.post("/terminals/:id/sync-employees", async (req, res) => {
       return res.status(403).json({ error: "Bu terminal sizga tegishli emas" });
     }
     const result = await syncEmployeesFromTerminal(pool, row);
-    if (!result.ok) return res.status(502).json(result);
+    // 422: terminalga ISAPI ulanmadi (502 nginx bilan adashmasin)
+    if (!result.ok) return res.status(422).json(result);
     res.json(result);
   } catch (err) {
     console.error(err);
