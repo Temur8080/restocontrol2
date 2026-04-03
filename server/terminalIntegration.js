@@ -133,18 +133,28 @@ async function getTerminalEventTimezoneOffsetHours(pool) {
   return Math.max(-12, Math.min(14, n));
 }
 
+/**
+ * @returns {Promise<{ ok: boolean, reason?: string }>}
+ */
 export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const nameNorm = normalizeEmployeeEventName(eventEmployeeName(ev));
   const timeIso = eventTimeIso(ev);
-  if (!nameNorm || !timeIso) return false;
+  if (!nameNorm || !timeIso) {
+    const key = eventEmployeeKey(ev);
+    const bits = [];
+    if (!nameNorm) bits.push("ism_yoq");
+    if (!timeIso) bits.push("vaqt_yoq");
+    const hint = key ? `; terminal_raqami/karta=${key}` : "";
+    return { ok: false, reason: `${bits.join("+")}${hint} (hodim XMLda name/EmployeeName bo‘lishi yoki bazadagi ism bilan mos kelishi kerak)` };
+  }
 
   const dedupeKey = eventDedupeKey(terminalRow.id, ev);
   const fresh = await tryInsertDedupe(pool, terminalRow.id, dedupeKey);
-  if (!fresh) return false;
+  if (!fresh) return { ok: false, reason: "takroriy_hodisa (oldingi yuborilgan)" };
 
   const tzOffsetHours = await getTerminalEventTimezoneOffsetHours(pool);
   const dt = deviceEventDateTimeWithTargetOffset(timeIso, tzOffsetHours);
-  if (!dt) return false;
+  if (!dt) return { ok: false, reason: `vaqt_tahlil_xato (time="${timeIso.slice(0, 80)}")` };
 
   const empR = await pool.query(
     `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
@@ -153,7 +163,12 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
      LIMIT 1`,
     [terminalRow.admin_id, nameNorm]
   );
-  if (empR.rows.length === 0) return false;
+  if (empR.rows.length === 0) {
+    return {
+      ok: false,
+      reason: `hodim_topilmadi (ism="${nameNorm}" — bazada aynan shu ism; faqat ism bo‘yicha, karta ID emas)`,
+    };
+  }
 
   const emp = empR.rows[0];
   const adminId = emp.admin_id != null ? Number(emp.admin_id) : null;
@@ -173,7 +188,12 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
        ORDER BY id DESC LIMIT 1`,
       [eid, dt.date]
     );
-    if (openR.rows.length === 0) return false;
+    if (openR.rows.length === 0) {
+      return {
+        ok: false,
+        reason: `chiqish_mumkin_emas: ${dt.date} sanasida ochiq kirish (check-in) topilmadi — avval kirish yozilishi kerak`,
+      };
+    }
     const { rows } = await pool.query(
       `UPDATE employee_attendance SET check_out = $1,
          check_out_snapshot = CASE
@@ -187,7 +207,7 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     if (rows[0] && broadcast && adminId != null) {
       broadcast({ adminId, records: [rowToAttendanceRow(rows[0])] });
     }
-    return true;
+    return { ok: true };
   }
 
   const openR = await pool.query(
@@ -197,7 +217,12 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
      LIMIT 1`,
     [eid, dt.date]
   );
-  if (openR.rows.length > 0) return false;
+  if (openR.rows.length > 0) {
+    return {
+      ok: false,
+      reason: `kirish_mumkin_emas: ${dt.date} uchun allaqachon ochiq smena bor (check-out qilinmasdan ikkinchi kirish)`,
+    };
+  }
 
   const grace = await fetchLateGraceForEmployee(pool, eid);
   const lateFlag = computeCheckInLateFlag(emp, dt.date, dt.time, grace);
@@ -211,7 +236,7 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   if (rows[0] && broadcast && adminId != null) {
     broadcast({ adminId, records: [rowToAttendanceRow(rows[0])] });
   }
-  return true;
+  return { ok: true };
 }
 
 function defaultPollStartTime() {
@@ -264,7 +289,10 @@ async function pollOneTerminal(pool, terminalRow, broadcast) {
   for (const ev of list) {
     const ti = eventTimeIso(ev);
     if (ti && ti > maxTime) maxTime = ti;
-    await applyTerminalEvent(pool, terminalRow, ev, broadcast);
+    await applyTerminalEvent(pool, terminalRow, ev, broadcast).catch((e) => {
+      console.error(`[terminal poll] id=${terminalRow.id} applyTerminalEvent`, e);
+      return { ok: false };
+    });
   }
 
   if (maxTime && maxTime !== cursor) {

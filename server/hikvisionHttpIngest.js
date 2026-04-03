@@ -393,6 +393,20 @@ export async function handleHikvisionHttpEvent(req, pool) {
 
   const terminalIdParam = req.query?.terminalId ?? req.query?.terminal ?? "";
 
+  const nEv = parsed.events.length;
+  console.log(
+    `[hikvision http] qabul: hodisalar=${nEv}, deviceIp="${deviceIp || "—"}", ulanish_ip="${clientIp || "—"}"` +
+      (terminalIdParam ? `, terminalId_param=${terminalIdParam}` : "")
+  );
+
+  if (nEv === 0) {
+    const ctShort = String(ct || "").slice(0, 120);
+    const preview = buf.length === 0 ? "(bo‘sh tana)" : buf.slice(0, 200).toString("utf8").replace(/\s+/g, " ").trim();
+    console.warn(
+      `[hikvision http] tahlildan keyin 0 ta hodisa (Content-Type: ${ctShort || "—"}, tana ${buf.length} bayt). Boshlang‘ich: ${preview.slice(0, 160)}`
+    );
+  }
+
   let applied = 0;
   let lastTerminalId = null;
   for (const ev of parsed.events) {
@@ -400,17 +414,25 @@ export async function handleHikvisionHttpEvent(req, pool) {
     const terminalRow = await findTerminalRow(pool, deviceIp, clientIp, terminalIdParam, directionHint);
     if (!terminalRow) {
       console.warn(
-        `[hikvision http] Terminal topilmadi (qurilma IP: "${deviceIp || "—"}", ulanish IP: "${clientIp || "—"}")`
+        `[hikvision http] Terminal topilmadi — bazada ip_address="${deviceIp || clientIp || "—"}" yoki ?terminalId= mos kelishi kerak (qurilma_XML_ip="${deviceIp || "—"}", ulanish_ip="${clientIp || "—"}")`
       );
       continue;
     }
     lastTerminalId = terminalRow.id;
-    const ok = await applyTerminalEvent(pool, terminalRow, ev, emitAttendanceBroadcast);
-    if (ok) applied += 1;
+    const result = await applyTerminalEvent(pool, terminalRow, ev, emitAttendanceBroadcast);
+    if (result.ok) {
+      applied += 1;
+    } else if (result.reason) {
+      console.warn(`[hikvision http] hodisa saqlanmadi (terminal_id=${terminalRow.id}): ${result.reason}`);
+    }
   }
 
   if (applied > 0 && lastTerminalId != null) {
-    console.log(`[hikvision http] qayta ishlangan hodisalar: ${applied} (oxirgi terminal_id=${lastTerminalId})`);
+    console.log(`[hikvision http] muvaffaq: ${applied} ta yozuv (oxirgi terminal_id=${lastTerminalId})`);
+  } else if (nEv > 0 && applied === 0) {
+    console.warn(
+      `[hikvision http] ${nEv} ta hodisa keldi, lekin hech biri davomatga yozilmadi (yuqoridagi sabablarni ko‘ring)`
+    );
   }
 
   return { status: 200, body: "OK" };
