@@ -6870,6 +6870,9 @@ function App() {
                     </p>
                   ) : null}
                   {terminalProbeResult.error ? <p className="login-err">{terminalProbeResult.error}</p> : null}
+                  {terminalProbeResult.contextHint ? (
+                    <p className="salary-hint terminal-probe-context">{terminalProbeResult.contextHint}</p>
+                  ) : null}
                   <ul className="terminal-probe-steps">
                     {(terminalProbeResult.steps || []).map((s) => (
                       <li key={s.id} className={`terminal-probe-step ${s.ok ? "terminal-probe-step-ok" : "terminal-probe-step-fail"}`}>
