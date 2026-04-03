@@ -1,3 +1,4 @@
+import fs from "fs";
 import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -1842,6 +1843,17 @@ api.put("/settings/terminal-timezone", async (req, res) => {
 });
 
 app.use("/api", api);
+
+const distDir = path.join(__dirname, "..", "dist");
+const distIndexPath = path.join(distDir, "index.html");
+if (fs.existsSync(distIndexPath)) {
+  app.use(express.static(distDir, { index: false }));
+  app.use((req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
+    if (req.path.startsWith("/api")) return next();
+    res.sendFile(distIndexPath, (err) => next(err));
+  });
+}
 
 async function main() {
   await initSchema();
