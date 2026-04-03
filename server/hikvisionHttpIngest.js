@@ -179,6 +179,93 @@ function extractMultipartPartByFieldName(buffer, contentType, fieldName) {
   return null;
 }
 
+/** multipart/form-data ichidagi barcha qismlar (name + tana). */
+function listMultipartParts(buffer, contentType) {
+  const ct = String(contentType || "");
+  const bm = ct.match(/boundary\s*=\s*"?([^";\s]+)"?/i);
+  if (!bm || !Buffer.isBuffer(buffer)) return [];
+  const boundaryStr = bm[1].trim().replace(/^["']|["']$/g, "");
+  const delimiter = Buffer.from(`--${boundaryStr}`);
+  const parts = [];
+  let offset = 0;
+  for (;;) {
+    const idx = buffer.indexOf(delimiter, offset);
+    if (idx < 0) break;
+    let partBegin = idx + delimiter.length;
+    if (partBegin + 1 < buffer.length && buffer[partBegin] === 0x2d && buffer[partBegin + 1] === 0x2d) {
+      break;
+    }
+    if (partBegin + 1 < buffer.length && buffer[partBegin] === 0x0d && buffer[partBegin + 1] === 0x0a) {
+      partBegin += 2;
+    } else if (partBegin < buffer.length && buffer[partBegin] === 0x0a) {
+      partBegin += 1;
+    }
+    const nextBoundary = buffer.indexOf(delimiter, partBegin);
+    const partEnd = nextBoundary < 0 ? buffer.length : nextBoundary;
+    const part = buffer.subarray(partBegin, partEnd);
+    const headerSep = part.indexOf(Buffer.from("\r\n\r\n"));
+    if (headerSep < 0) {
+      offset = idx + delimiter.length;
+      continue;
+    }
+    const headers = part.subarray(0, headerSep).toString("latin1");
+    const nameMatch = headers.match(/name\s*=\s*"([^"]+)"/i) || headers.match(/name\s*=\s*([^;\r\n]+)/i);
+    const fn = nameMatch ? String(nameMatch[1] || nameMatch[2]).trim().replace(/^"|"$/g, "") : "";
+    let body = part.subarray(headerSep + 4);
+    while (
+      body.length >= 2 &&
+      body[body.length - 2] === 0x0d &&
+      body[body.length - 1] === 0x0a
+    ) {
+      body = body.subarray(0, body.length - 2);
+    }
+    while (body.length >= 1 && body[body.length - 1] === 0x0a) {
+      body = body.subarray(0, body.length - 1);
+    }
+    if (body.length > 0) parts.push({ name: fn, body });
+    offset = idx + delimiter.length;
+  }
+  return parts;
+}
+
+/** JPEG qismi — UTF-8 tekshiruvdan tashlab ketish. */
+function looksLikeBinaryImageBody(body) {
+  return body.length > 500 && body[0] === 0xff && body[1] === 0xd8;
+}
+
+/**
+ * Bitta matndan JSON yoki XML Hikvision hodisasini ajratib `out` ga qo‘shadi.
+ * @returns {boolean} — biror hodisa qo‘shildi yoki deviceIp topildi
+ */
+function tryProcessPayloadString(txt, out) {
+  const s = String(txt || "").trim();
+  if (!s) return false;
+  const evBefore = out.events.length;
+  const dipBefore = out.deviceIp;
+
+  if (s.startsWith("{") || s.startsWith("[")) {
+    try {
+      appendEventsFromHikvisionJson(JSON.parse(s), out);
+      return out.events.length > evBefore || (!!out.deviceIp && out.deviceIp !== dipBefore);
+    } catch {
+      return false;
+    }
+  }
+
+  if (
+    s.includes("<") &&
+    (/AccessControl/i.test(s) || /EventNotification/i.test(s) || /<\?xml/i.test(s))
+  ) {
+    const nested = parseHikvisionHttpPayload(Buffer.from(s, "utf8"), "application/xml");
+    if (nested.events.length > 0 || nested.deviceIp) {
+      if (nested.deviceIp) out.deviceIp = nested.deviceIp || out.deviceIp;
+      out.events.push(...nested.events);
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Hikvision AccessControl JSON obyektidan hodisa qo‘shadi (HTTP multipart ichidagi JSON). */
 function appendEventsFromHikvisionJson(j, out) {
   const root = Array.isArray(j) ? j[0] : j;
@@ -312,38 +399,30 @@ function extractXmlPayload(buffer, contentType) {
 }
 
 /**
- * Hikvision HTTP monitoring tanasi → AccessControl hodisalari ro‘yxati + qurilma IP.
+ * Hikvision HTTP monitoring tanasi → AccessControl hodisalari.
+ * Qo‘llab-quvvatlanadi: to‘g‘ri XML, to‘g‘ri JSON, multipart/form-data (har qismda JSON yoki XML),
+ * Content-Type: application/json | text/xml | application/xml | multipart/form-data.
  */
 export function parseHikvisionHttpPayload(buffer, contentType) {
   const ct = String(contentType || "");
   const out = { deviceIp: "", events: [] };
 
   if (/multipart\/form-data/i.test(ct) && Buffer.isBuffer(buffer)) {
-    const fieldNames = ["AccessControllerEvent", "AccessControlEvent", "EventNotificationAlert"];
+    const fieldNames = [
+      "AccessControllerEvent",
+      "AccessControlEvent",
+      "EventNotificationAlert",
+      "AcsEvent",
+      "event",
+    ];
     for (const fieldName of fieldNames) {
       const partBody = extractMultipartPartByFieldName(buffer, ct, fieldName);
       if (!partBody || partBody.length === 0) continue;
-      const txt = partBody.toString("utf8").trim();
-      if (!txt) continue;
-      if (txt.startsWith("{") || txt.startsWith("[")) {
-        try {
-          appendEventsFromHikvisionJson(JSON.parse(txt), out);
-          if (out.events.length > 0 || out.deviceIp) return out;
-        } catch {
-          /* boshqa qism yoki XML */
-        }
-      }
-      if (
-        txt.includes("<") &&
-        (/AccessControl/i.test(txt) || /EventNotification/i.test(txt) || /<\?xml/i.test(txt))
-      ) {
-        const nested = parseHikvisionHttpPayload(Buffer.from(txt, "utf8"), "application/xml");
-        if (nested.events.length > 0 || nested.deviceIp) {
-          if (nested.deviceIp) out.deviceIp = nested.deviceIp;
-          out.events.push(...nested.events);
-          return out;
-        }
-      }
+      if (tryProcessPayloadString(partBody.toString("utf8"), out)) return out;
+    }
+    for (const { body } of listMultipartParts(buffer, ct)) {
+      if (looksLikeBinaryImageBody(body)) continue;
+      if (tryProcessPayloadString(body.toString("utf8"), out)) return out;
     }
   }
 
