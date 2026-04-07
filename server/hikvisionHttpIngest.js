@@ -419,6 +419,18 @@ function personNameFromXmlBlock(block) {
     if (!v) v = xmlTagInner(block, tag);
     if (v != null && String(v).trim()) return String(v).trim();
   }
+  const gn =
+    xmlFirstTagValue(block, "givenName") ||
+    xmlFirstTagValue(block, "GivenName") ||
+    xmlFirstTagValue(block, "firstName") ||
+    xmlFirstTagValue(block, "FirstName");
+  const fn =
+    xmlFirstTagValue(block, "familyName") ||
+    xmlFirstTagValue(block, "FamilyName") ||
+    xmlFirstTagValue(block, "lastName") ||
+    xmlFirstTagValue(block, "LastName");
+  const parts = [gn, fn].map((s) => String(s || "").trim()).filter(Boolean);
+  if (parts.length) return parts.join(" ");
   return "";
 }
 
@@ -428,6 +440,10 @@ function personNameFromAccessControl(ac) {
     const v = ac[k];
     if (v != null && String(v).trim()) return String(v).trim();
   }
+  const gn = ac.givenName ?? ac.GivenName ?? ac.firstName ?? ac.FirstName;
+  const fn = ac.familyName ?? ac.FamilyName ?? ac.lastName ?? ac.LastName;
+  const parts = [gn, fn].map((s) => String(s ?? "").trim()).filter(Boolean);
+  if (parts.length) return parts.join(" ");
   return "";
 }
 
@@ -616,7 +632,8 @@ async function findTerminalRow(pool, deviceIpNorm, clientIpNorm, preferredTermin
 }
 
 /**
- * Terminal sozlamalari: POST http://HOST:8000/api/hikvision/event
+ * Terminal sozlamalari: POST https://DOMEN/api/hikvision/event (Nginx → 127.0.0.1:8000).
+ * Maxsus holatda to‘g‘ridan-to‘g‘ri: POST http://HOST:8000/api/hikvision/event
  */
 export async function handleHikvisionHttpEvent(req, pool) {
   const secret = process.env.HIKVISION_HTTP_SECRET;

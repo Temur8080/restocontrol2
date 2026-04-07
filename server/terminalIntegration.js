@@ -12,7 +12,7 @@ import {
 } from "./terminalHikvision.js";
 import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.js";
 import { resolveSnapshotForTerminalEvent } from "./attendanceFaceImages.js";
-import { employeeMatchByNormalizedNameSql } from "./employeeAccessCards.js";
+import { employeeMatchByAccessCardSql } from "./employeeAccessCards.js";
 import { isCheckoutTerminalType, isExitLikeAccessEvent } from "./hikvisionAccessDirection.js";
 import { isPrivateLanHostname } from "./terminalProbe.js";
 
@@ -188,18 +188,22 @@ async function getTerminalEventTimezoneOffsetHours(pool) {
 }
 
 /**
+ * Terminal hodisasi: hodimni faqat hodisa kaliti bilan bog‘laymiz (employeeNoString / employeeNo / cardNo ↔ access_card_no).
+ * Bazada ism bo‘yicha qidiruv yo‘q. Ism hodisadan kelsa, hodim yozuviga yoziladi/yangilanadi.
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
 export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
-  const nameNorm = normalizeEmployeeEventName(eventEmployeeName(ev));
+  const nameFromEvent = normalizeEmployeeEventName(eventEmployeeName(ev));
+  const empKey = eventEmployeeKey(ev);
   const timeIso = eventTimeIso(ev);
-  if (!nameNorm || !timeIso) {
-    const key = eventEmployeeKey(ev);
+  if (!empKey || !timeIso) {
     const bits = [];
-    if (!nameNorm) bits.push("ism_yoq");
+    if (!empKey) bits.push("hodisa_kaliti_yoq");
     if (!timeIso) bits.push("vaqt_yoq");
-    const hint = key ? `; terminal_raqami/karta=${key}` : "";
-    return { ok: false, reason: `${bits.join("+")}${hint} (hodim XMLda name/EmployeeName bo‘lishi yoki bazadagi ism bilan mos kelishi kerak)` };
+    return {
+      ok: false,
+      reason: `${bits.join("+")} (hodisada employeeNoString/employeeNo/cardNo va vaqt bo‘lishi kerak)`,
+    };
   }
 
   const dedupeKey = eventDedupeKey(terminalRow.id, ev);
@@ -210,18 +214,30 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const dt = deviceEventDateTimeWithTargetOffset(timeIso, tzOffsetHours);
   if (!dt) return { ok: false, reason: `vaqt_tahlil_xato (time="${timeIso.slice(0, 80)}")` };
 
-  const empR = await pool.query(
+  const adminId = Number(terminalRow.admin_id);
+  if (!Number.isFinite(adminId)) {
+    return { ok: false, reason: "terminal_admin_yoq" };
+  }
+
+  let empR = await pool.query(
     `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
      FROM employees e
-     WHERE ${employeeMatchByNormalizedNameSql}
+     WHERE ${employeeMatchByAccessCardSql}
      LIMIT 1`,
-    [terminalRow.admin_id, nameNorm]
+    [adminId, empKey]
   );
+
   if (empR.rows.length === 0) {
-    return {
-      ok: false,
-      reason: `hodim_topilmadi (ism="${nameNorm}" — bazada aynan shu ism; faqat ism bo‘yicha, karta ID emas)`,
-    };
+    const defaultFilial = await getDefaultFilialForAdmin(pool, adminId);
+    const newName = nameFromEvent || `Hodim ${String(empKey).trim()}`;
+    empR = await pool.query(
+      `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end, access_card_no)
+       VALUES ($1, $2, 'Hodim', $3, '09:00', '18:00', $4)
+       RETURNING id, admin_id, shift_start, shift_end, weekly_schedule`,
+      [adminId, newName, defaultFilial, String(empKey).trim()]
+    );
+  } else if (nameFromEvent) {
+    await pool.query(`UPDATE employees SET name = $1 WHERE id = $2`, [nameFromEvent, empR.rows[0].id]);
   }
 
   const emp = empR.rows[0];

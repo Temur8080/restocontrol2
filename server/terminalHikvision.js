@@ -332,6 +332,10 @@ export const HIKVISION_PERSON_NAME_KEYS = [
   "PersonName",
   "userName",
   "UserName",
+  "fullName",
+  "FullName",
+  "label",
+  "Label",
 ];
 
 /** Hodisa tanasidan ko'rinadigan ism (keldi-ketdi bazada shu bilan bog'lanadi). */
