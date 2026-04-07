@@ -647,6 +647,29 @@ export async function handleHikvisionHttpEvent(req, pool) {
   const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body || ""), "utf8");
   const ct = req.get("content-type") || "";
   const clientIp = getWebhookClientIp(req);
+  const debugHttp = String(process.env.HIKVISION_HTTP_DEBUG || "").trim() === "1";
+
+  if (debugHttp) {
+    const hdr = {
+      host: req.get("host") || "",
+      "x-real-ip": req.get("x-real-ip") || "",
+      "x-forwarded-for": req.get("x-forwarded-for") || "",
+      "x-forwarded-proto": req.get("x-forwarded-proto") || "",
+      "content-type": ct,
+      "content-length": req.get("content-length") || "",
+    };
+    console.log(
+      `[hikvision http][debug] ${req.method} ${req.originalUrl || ""} headers=${JSON.stringify(hdr)}`
+    );
+    const peek = Math.min(buf.length, 1500);
+    const sample = buf
+      .subarray(0, peek)
+      .toString("utf8")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 800);
+    console.log(`[hikvision http][debug] tana=${buf.length}b, namuna: ${sample}${peek < buf.length ? "…" : ""}`);
+  }
 
   if (bufferLooksLikeHeartbeat(buf)) {
     console.log(`[hikvision http] heartBeat → 200 OK (ip="${clientIp}", tana=${buf.length}b)`);
@@ -674,6 +697,20 @@ export async function handleHikvisionHttpEvent(req, pool) {
     `[hikvision http] qabul: hodisalar=${nEv}, deviceIp="${deviceIp || "—"}", ulanish_ip="${clientIp}"` +
       (terminalIdParam ? `, terminalId_param=${terminalIdParam}` : "")
   );
+
+  if (debugHttp && nEv > 0) {
+    const e0 = parsed.events[0];
+    const snap = {
+      employeeNoString: e0?.employeeNoString,
+      employeeNo: e0?.employeeNo,
+      cardNo: e0?.cardNo,
+      name: e0?.name,
+      time: e0?.time,
+      major: e0?.major,
+      minor: e0?.minor,
+    };
+    console.log(`[hikvision http][debug] 1-hodisa maydonlari: ${JSON.stringify(snap)}`);
+  }
 
   if (nEv === 0) {
     const ctShort = String(ct || "").slice(0, 120);

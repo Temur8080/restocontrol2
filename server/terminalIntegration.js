@@ -241,7 +241,6 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   }
 
   const emp = empR.rows[0];
-  const adminId = emp.admin_id != null ? Number(emp.admin_id) : null;
   const eid = Number(emp.id);
 
   const chiqishQurilma = isCheckoutTerminalType(terminalRow.terminal_type);
