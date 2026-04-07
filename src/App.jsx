@@ -7,7 +7,14 @@ import {
   clearAuthSession,
   resolveMediaUrl,
 } from "./api.js";
-import { translate, translateApiError, localeToBcp47, LOCALE_STORAGE_KEY } from "./i18n/index.js";
+import {
+  translate,
+  translateApiError,
+  localeToBcp47,
+  capitalizeLocaleFirst,
+  LOCALE_STORAGE_KEY,
+} from "./i18n/index.js";
+import { ReportMonthPicker } from "./ReportMonthPicker.jsx";
 import logoImage from "../logo_1.png";
 import brandLogo from "../logo_2.png";
 import loginBgImage from "../login_1.jpg";
@@ -21,6 +28,7 @@ import {
   LogOut,
   Moon,
   Plus,
+  UserPlus,
   Pencil,
   Settings2,
   Sun,
@@ -34,8 +42,13 @@ import {
   Wallet,
   X,
 } from "lucide-react";
+import ExcelJS from "exceljs";
 
 const menuItems = ["Dashboard", "Hodimlar", "Hisobot", "Sozlamalar"];
+const DEFAULT_ACTIVE_MENU = "Dashboard";
+/** Menus shown in sidebar + Bildirishnoma (bottom bell) for each role after bootstrap */
+const ADMIN_ROLE_MENUS = ["Dashboard", "Hodimlar", "Hisobot", "Sozlamalar", "Bildirishnoma"];
+const SUPERADMIN_ROLE_MENUS = ["Adminlar", "Terminallar", "Baza", "Sozlamalar", "Bildirishnoma"];
 const ACTIVE_MENU_STORAGE_KEY = "active-menu";
 const DENSITY_STORAGE_KEY = "ui-density";
 const ALL_FILIALS_VALUE = "__all_filials__";
@@ -723,6 +736,83 @@ function sumEarnedSalaryInMonth(employee, yearMonth, attendanceRecords, roleSala
   return Math.round(total);
 }
 
+/** Hisobot sanalari: oy ichida [from, to] ni qaytaradi. */
+function clampSalaryReportRange(yearMonth, fromYmd, toYmd) {
+  const days = eachDateStrInMonth(yearMonth);
+  if (days.length === 0) {
+    const y = String(yearMonth || "").slice(0, 7);
+    return { from: `${y}-01`, to: `${y}-01` };
+  }
+  const first = days[0];
+  const last = days[days.length - 1];
+  let from =
+    fromYmd && /^\d{4}-\d{2}-\d{2}$/.test(String(fromYmd)) ? String(fromYmd).slice(0, 10) : first;
+  let to = toYmd && /^\d{4}-\d{2}-\d{2}$/.test(String(toYmd)) ? String(toYmd).slice(0, 10) : last;
+  if (from < first || from > last) from = first;
+  if (to < first || to > last) to = last;
+  if (from > to) {
+    const s = from;
+    from = to;
+    to = s;
+  }
+  return { from, to };
+}
+
+function salaryReportMonthBounds(ym) {
+  const days = eachDateStrInMonth(ym);
+  return { from: days[0] || `${ym}-01`, to: days[days.length - 1] || `${ym}-01` };
+}
+
+function sumEarnedSalaryInMonthDateRange(
+  employee,
+  yearMonth,
+  fromYmd,
+  toYmd,
+  attendanceRecords,
+  roleSalaries,
+  overrides,
+  salaryCalcConfig
+) {
+  const { from, to } = clampSalaryReportRange(yearMonth, fromYmd, toYmd);
+  let total = 0;
+  for (const dateStr of eachDateStrInMonth(yearMonth)) {
+    if (dateStr < from || dateStr > to) continue;
+    const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, 5);
+    total += getEmployeeEarnedSalary(employee, dateStr, att, roleSalaries, overrides, salaryCalcConfig);
+  }
+  return Math.round(total);
+}
+
+function sumWorkedHoursInMonthDateRange(
+  employee,
+  yearMonth,
+  fromYmd,
+  toYmd,
+  attendanceRecords,
+  attendanceMode = "first_last"
+) {
+  const { from, to } = clampSalaryReportRange(yearMonth, fromYmd, toYmd);
+  let total = 0;
+  for (const dateStr of eachDateStrInMonth(yearMonth)) {
+    if (dateStr < from || dateStr > to) continue;
+    const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, 5);
+    total += getWorkedHoursOnDay(employee, dateStr, att, attendanceMode);
+  }
+  return Math.round(total * 100) / 100;
+}
+
+function hasCompletedCheckoutInDateRange(employeeId, fromYmd, toYmd, records) {
+  if (!fromYmd || !toYmd || !Array.isArray(records)) return false;
+  for (const r of records) {
+    if (!sameEmployeeId(r.employeeId, employeeId)) continue;
+    const d = toAttendanceDateKey(r.date);
+    if (!d || d < fromYmd || d > toYmd) continue;
+    const co = r.checkOut;
+    if (co != null && String(co).trim() !== "") return true;
+  }
+  return false;
+}
+
 function getWorkedHoursOnDay(employee, dateStr, attendance, attendanceMode = "first_last") {
   const sh = getShiftForDate(employee, dateStr);
   if (!sh.work) return 0;
@@ -781,7 +871,8 @@ function formatMonthHeading(yearMonth, localeCode) {
   const m = Number.parseInt(parts[1], 10);
   if (!Number.isFinite(y) || !Number.isFinite(m)) return String(yearMonth);
   const d = new Date(y, m - 1, 1);
-  return d.toLocaleDateString(localeToBcp47(localeCode), { month: "long", year: "numeric" });
+  const raw = d.toLocaleDateString(localeToBcp47(localeCode), { month: "long", year: "numeric" });
+  return capitalizeLocaleFirst(raw, localeCode);
 }
 
 function formatTimezonePreviewDateTime(offsetHours) {
@@ -810,6 +901,148 @@ function sparklinePath(values, width = 220, height = 64) {
   return d;
 }
 
+/** Hisobot jadvalidagi raqamlar bilan bir xil (oy + from/to + segment). */
+function computeHisobotTableRowMetrics(employee, ctx) {
+  const {
+    salaryReportMonth,
+    salaryReportRangeFrom,
+    salaryReportRangeTo,
+    salaryReportSegment,
+    attendanceRecords,
+    roleSalaries,
+    employeeSalaryOverrides,
+    salaryPayments,
+    salaryAdjustments,
+    salaryCalcSelectedFilial,
+    salaryCalcWeekMode,
+    salaryCalcWeekFixed,
+    salaryCalcMonthMode,
+    salaryCalcMonthFixed,
+    salaryCalcAttendanceMode,
+    salaryCalcConfigsByFilial,
+    salaryCalcDefaultConfig,
+  } = ctx;
+  const empFilial = getEmployeeFilialRaw(employee);
+  const cfg =
+    empFilial === salaryCalcSelectedFilial
+      ? {
+          weekMode: salaryCalcWeekMode,
+          weekFixed: salaryCalcWeekFixed,
+          monthMode: salaryCalcMonthMode,
+          monthFixed: salaryCalcMonthFixed,
+          attendanceMode: salaryCalcAttendanceMode,
+        }
+      : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
+  const rate = getEmployeeSalary(employee, roleSalaries, employeeSalaryOverrides);
+  const hasOverride = employeeSalaryOverrides[String(employee.id)] != null;
+  const { from: repFrom, to: repTo } = clampSalaryReportRange(
+    salaryReportMonth,
+    salaryReportRangeFrom,
+    salaryReportRangeTo
+  );
+  const payMonth = sumEarnedSalaryInMonthDateRange(
+    employee,
+    salaryReportMonth,
+    repFrom,
+    repTo,
+    attendanceRecords,
+    roleSalaries,
+    employeeSalaryOverrides,
+    cfg
+  );
+  const paidMonthAmount = (salaryPayments || []).reduce((acc, p) => {
+    if (!sameEmployeeId(p.employeeId, employee.id)) return acc;
+    const d = toAttendanceDateKey(p.date);
+    if (!d || d < repFrom || d > repTo) return acc;
+    const amt = Number(p.amount);
+    return acc + (Number.isFinite(amt) ? Math.max(0, Math.trunc(amt)) : 0);
+  }, 0);
+  const bonusByDate = new Map();
+  const fineByDate = new Map();
+  const advanceByDate = new Map();
+  for (const adj of salaryAdjustments || []) {
+    if (!sameEmployeeId(adj.employeeId, employee.id)) continue;
+    const d = toAttendanceDateKey(adj.date);
+    if (!d || d < repFrom || d > repTo) continue;
+    const amt = Math.max(0, Math.trunc(Number(adj.amount) || 0));
+    const kind = normalizeAdjustmentKind(adj.kind);
+    if (kind === "fine") fineByDate.set(d, (fineByDate.get(d) || 0) + amt);
+    else if (kind === "advance") advanceByDate.set(d, (advanceByDate.get(d) || 0) + amt);
+    else if (kind === "bonus") bonusByDate.set(d, (bonusByDate.get(d) || 0) + amt);
+  }
+  let bonusMonth = 0;
+  let fineMonth = 0;
+  let advanceMonth = 0;
+  for (const v of bonusByDate.values()) bonusMonth += v;
+  for (const v of fineByDate.values()) fineMonth += v;
+  for (const v of advanceByDate.values()) advanceMonth += v;
+  const payMonthAdjusted = Math.max(0, payMonth + bonusMonth - fineMonth - advanceMonth);
+  const payMonthRemaining = Math.max(0, payMonthAdjusted - paidMonthAmount);
+  const isPaidSegment = salaryReportSegment === "with_pay" || salaryReportSegment === "finished";
+  const reportPayDisplay = isPaidSegment ? payMonthAdjusted : payMonthRemaining;
+  let remainingDaysInMonth = 0;
+  let paidDaysInMonth = 0;
+  let remainingWorkedHoursMonth = 0;
+  let paidWorkedHoursMonth = 0;
+  for (const dateStr of eachDateStrInMonth(salaryReportMonth)) {
+    if (dateStr < repFrom || dateStr > repTo) continue;
+    const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, 5);
+    const dayPay = getEmployeeEarnedSalary(
+      employee,
+      dateStr,
+      att,
+      roleSalaries,
+      employeeSalaryOverrides,
+      cfg
+    );
+    if (dayPay <= 0) continue;
+    const paidDateAmount = (salaryPayments || []).reduce((acc, p) => {
+      if (!sameEmployeeId(p.employeeId, employee.id)) return acc;
+      if (toAttendanceDateKey(p.date) !== dateStr) return acc;
+      const amt = Number(p.amount);
+      return acc + (Number.isFinite(amt) ? Math.max(0, Math.trunc(amt)) : 0);
+    }, 0);
+    const bonusDay = bonusByDate.get(dateStr) || 0;
+    const fineDay = fineByDate.get(dateStr) || 0;
+    const advanceDay = advanceByDate.get(dateStr) || 0;
+    const adjustedDayPay = Math.max(0, dayPay + bonusDay - fineDay - advanceDay);
+    const remainingDayPay = adjustedDayPay - paidDateAmount;
+    const dayHours = getWorkedHoursOnDay(employee, dateStr, att, cfg?.attendanceMode);
+    if (remainingDayPay > 0) {
+      remainingDaysInMonth += 1;
+      remainingWorkedHoursMonth += dayHours;
+    } else if (paidDateAmount > 0) {
+      paidDaysInMonth += 1;
+      paidWorkedHoursMonth += dayHours;
+    }
+  }
+  const workedHoursMonth = sumWorkedHoursInMonthDateRange(
+    employee,
+    salaryReportMonth,
+    repFrom,
+    repTo,
+    attendanceRecords,
+    cfg?.attendanceMode
+  );
+  const reportHoursDisplay = isPaidSegment ? workedHoursMonth : remainingWorkedHoursMonth;
+  const reportDaysDisplay = isPaidSegment ? paidDaysInMonth : remainingDaysInMonth;
+  return {
+    repFrom,
+    repTo,
+    rate,
+    hasOverride,
+    reportHoursDisplay,
+    reportPayDisplay,
+    reportDaysDisplay,
+    payMonthAdjusted,
+    payMonthRemaining,
+    paidMonthAmount,
+    workedHoursMonth,
+    remainingWorkedHoursMonth,
+    paidWorkedHoursMonth,
+  };
+}
+
 function App() {
   const [authToken, setAuthToken] = useState(() => getStoredToken());
   const [sessionUser, setSessionUser] = useState(() => getStoredUsername());
@@ -824,9 +1057,9 @@ function App() {
   const [activeMenu, setActiveMenu] = useState(() => {
     try {
       const v = localStorage.getItem(ACTIVE_MENU_STORAGE_KEY);
-      return menuItems.includes(v) ? v : "Hodimlar";
+      return menuItems.includes(v) ? v : DEFAULT_ACTIVE_MENU;
     } catch {
-      return "Hodimlar";
+      return DEFAULT_ACTIVE_MENU;
     }
   });
   const [locale, setLocale] = useState(() => {
@@ -879,6 +1112,14 @@ function App() {
   const [dashboardTrendMode, setDashboardTrendMode] = useState("attendance");
   const [liveNow, setLiveNow] = useState(() => new Date());
   const [salaryReportMonth, setSalaryReportMonth] = useState(() => getTodayDate().slice(0, 7));
+  const [salaryReportRangeFrom, setSalaryReportRangeFrom] = useState(() => {
+    const ym = getTodayDate().slice(0, 7);
+    return salaryReportMonthBounds(ym).from;
+  });
+  const [salaryReportRangeTo, setSalaryReportRangeTo] = useState(() => {
+    const ym = getTodayDate().slice(0, 7);
+    return salaryReportMonthBounds(ym).to;
+  });
   const [salaryReportSegment, setSalaryReportSegment] = useState("all");
   const [filialFilter, setFilialFilter] = useState("all");
   const [cardFilter, setCardFilter] = useState("all");
@@ -928,6 +1169,11 @@ function App() {
   const [terminalProbeResult, setTerminalProbeResult] = useState(null);
   const [terminalSyncBusy, setTerminalSyncBusy] = useState(false);
   const [terminalTableSyncBusyId, setTerminalTableSyncBusyId] = useState(null);
+  const [terminalSyncResultModal, setTerminalSyncResultModal] = useState({
+    open: false,
+    message: "",
+    isError: false,
+  });
 
   const [userCreateModalOpen, setUserCreateModalOpen] = useState(false);
   const [userCreateBusy, setUserCreateBusy] = useState(false);
@@ -1382,13 +1628,11 @@ function App() {
         // Respect stored active menu on reload; fall back by role if needed
         let nextMenu = activeMenu;
         if (d.userRole === "hodim") {
-          if (!["Hisobot"].includes(nextMenu)) nextMenu = "Hisobot";
+          if (!["Hisobot", "Bildirishnoma"].includes(nextMenu)) nextMenu = "Hisobot";
         } else if (d.userRole === "superadmin") {
-          if (!["Adminlar", "Dashboard", "Hodimlar", "Hisobot", "Sozlamalar", "Baza", "Terminallar", "Bildirishnoma"].includes(nextMenu)) {
-            nextMenu = "Adminlar";
-          }
+          if (!SUPERADMIN_ROLE_MENUS.includes(nextMenu)) nextMenu = "Adminlar";
         } else {
-          if (!["Dashboard", "Hodimlar", "Hisobot", "Sozlamalar"].includes(nextMenu)) nextMenu = "Hodimlar";
+          if (!ADMIN_ROLE_MENUS.includes(nextMenu)) nextMenu = DEFAULT_ACTIVE_MENU;
         }
         setActiveMenu(nextMenu);
         setLoadError(null);
@@ -1616,7 +1860,11 @@ function App() {
       maxDailyFine: 50000,
     });
     setSalaryPolicyEmployeeOverrides({});
-    setSalaryReportMonth(getTodayDate().slice(0, 7));
+    const ymR = getTodayDate().slice(0, 7);
+    const bR = salaryReportMonthBounds(ymR);
+    setSalaryReportMonth(ymR);
+    setSalaryReportRangeFrom(bR.from);
+    setSalaryReportRangeTo(bR.to);
     setSalaryReportSegment("all");
     setAttendanceHistoryLightbox(null);
     setAttendanceHistoryEmployee(null);
@@ -1708,9 +1956,16 @@ function App() {
           : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
       const rate = getEmployeeSalary(employee, roleSalaries, employeeSalaryOverrides);
       const rateKind = normalizeSalaryRateType(rate);
-      const pay = sumEarnedSalaryInMonth(
+      const { from: rFrom, to: rTo } = clampSalaryReportRange(
+        salaryReportMonth,
+        salaryReportRangeFrom,
+        salaryReportRangeTo
+      );
+      const pay = sumEarnedSalaryInMonthDateRange(
         employee,
         salaryReportMonth,
+        rFrom,
+        rTo,
         attendanceRecords,
         roleSalaries,
         employeeSalaryOverrides,
@@ -1719,7 +1974,7 @@ function App() {
       const paidMonth = (salaryPayments || []).reduce((acc, p) => {
         if (!sameEmployeeId(p.employeeId, employee.id)) return acc;
         const d = toAttendanceDateKey(p.date);
-        if (!d || !d.startsWith(salaryReportMonth)) return acc;
+        if (!d || d < rFrom || d > rTo) return acc;
         const amt = Number(p.amount);
         return acc + (Number.isFinite(amt) ? Math.max(0, Math.trunc(amt)) : 0);
       }, 0);
@@ -1729,7 +1984,7 @@ function App() {
       for (const adj of salaryAdjustments || []) {
         if (!sameEmployeeId(adj.employeeId, employee.id)) continue;
         const d = toAttendanceDateKey(adj.date);
-        if (!d || !d.startsWith(salaryReportMonth)) continue;
+        if (!d || d < rFrom || d > rTo) continue;
         const amt = Math.max(0, Math.trunc(Number(adj.amount) || 0));
         const kind = normalizeAdjustmentKind(adj.kind);
         if (kind === "fine") fineMonth += amt;
@@ -1738,13 +1993,15 @@ function App() {
       }
       const adjustedPay = Math.max(0, pay + bonusMonth - fineMonth - advanceMonth);
       const remaining = Math.max(0, adjustedPay - paidMonth);
-      const finished = hasCompletedCheckoutInMonth(employee.id, salaryReportMonth, attendanceRecords);
+      const finished = hasCompletedCheckoutInDateRange(employee.id, rFrom, rTo, attendanceRecords);
       return { employee, pay: remaining, grossPay: adjustedPay, paidMonth, rateKind, finished };
     });
   }, [
     activeMenu,
     employeesAfterCardFilter,
     salaryReportMonth,
+    salaryReportRangeFrom,
+    salaryReportRangeTo,
     attendanceRecords,
     roleSalaries,
     employeeSalaryOverrides,
@@ -1786,6 +2043,12 @@ function App() {
     };
   }, [salaryReportRows]);
 
+  const hisobotReportRangeSubtitle = useMemo(() => {
+    const b = salaryReportMonthBounds(salaryReportMonth);
+    if (salaryReportRangeFrom === b.from && salaryReportRangeTo === b.to) return null;
+    return `${formatAttendanceDate(salaryReportRangeFrom, locale)} — ${formatAttendanceDate(salaryReportRangeTo, locale)}`;
+  }, [salaryReportMonth, salaryReportRangeFrom, salaryReportRangeTo, locale]);
+
   const filteredEmployees = useMemo(() => {
     if (activeMenu !== "Hisobot" || salaryReportSegment === "all") return employeesAfterCardFilter;
     if (!salaryReportRows) return employeesAfterCardFilter;
@@ -1811,6 +2074,291 @@ function App() {
     return employeesAfterCardFilter.filter((e) => ids.has(e.id));
   }, [activeMenu, employeesAfterCardFilter, salaryReportRows, salaryReportSegment]);
 
+  const hisobotRowCtx = useMemo(
+    () => ({
+      salaryReportMonth,
+      salaryReportRangeFrom,
+      salaryReportRangeTo,
+      salaryReportSegment,
+      attendanceRecords,
+      roleSalaries,
+      employeeSalaryOverrides,
+      salaryPayments,
+      salaryAdjustments,
+      salaryCalcSelectedFilial,
+      salaryCalcWeekMode,
+      salaryCalcWeekFixed,
+      salaryCalcMonthMode,
+      salaryCalcMonthFixed,
+      salaryCalcAttendanceMode,
+      salaryCalcConfigsByFilial,
+      salaryCalcDefaultConfig,
+    }),
+    [
+      salaryReportMonth,
+      salaryReportRangeFrom,
+      salaryReportRangeTo,
+      salaryReportSegment,
+      attendanceRecords,
+      roleSalaries,
+      employeeSalaryOverrides,
+      salaryPayments,
+      salaryAdjustments,
+      salaryCalcSelectedFilial,
+      salaryCalcWeekMode,
+      salaryCalcWeekFixed,
+      salaryCalcMonthMode,
+      salaryCalcMonthFixed,
+      salaryCalcAttendanceMode,
+      salaryCalcConfigsByFilial,
+      salaryCalcDefaultConfig,
+    ]
+  );
+
+  const exportHisobotExcel = useCallback(async () => {
+    if (activeMenu !== "Hisobot") return;
+    const segmentLabel = (seg) => {
+      const map = {
+        all: "report.exportSegAll",
+        with_pay: "report.exportSegWithPay",
+        soat: "report.exportSegHourly",
+        kun: "report.exportSegDaily",
+        hafta: "report.exportSegWeekly",
+        oy: "report.exportSegMonthly",
+        finished: "report.exportSegFinished",
+      };
+      return t(map[seg] || "report.exportSegAll");
+    };
+    const { from: rf, to: rt } = clampSalaryReportRange(
+      salaryReportMonth,
+      salaryReportRangeFrom,
+      salaryReportRangeTo
+    );
+    const isPaidSegment = salaryReportSegment === "with_pay" || salaryReportSegment === "finished";
+    const isAllSegment = salaryReportSegment === "all";
+    const amountColNote = isPaidSegment ? t("report.exportAmountAccrued") : t("report.exportAmountRemaining");
+    const headerLabels = isAllSegment
+      ? [
+          t("table.employee"),
+          t("table.role"),
+          t("table.hoursWorked"),
+          t("report.exportPaidHours"),
+          `${t("table.calculatedPay")} (${t("report.exportAmountAccrued")})`,
+          t("report.segFinished"),
+          `${t("table.calculatedPay")} (${t("report.exportAmountRemaining")})`,
+          t("table.branch"),
+        ]
+      : [
+          t("table.employee"),
+          t("table.role"),
+          t("table.rate"),
+          t("table.hoursWorked"),
+          `${t("table.calculatedPay")} (${amountColNote})`,
+          t("table.paidDays"),
+          t("table.branch"),
+          t("report.exportColCustomRate"),
+        ];
+    const dataRows = filteredEmployees.map((emp) => {
+      const m = computeHisobotTableRowMetrics(emp, hisobotRowCtx);
+      const rateNum = Number(m.rate);
+      const rateText = Number.isFinite(rateNum) && rateNum > 0 ? fmtMoney(rateNum) : "—";
+      const daysText = `${m.reportDaysDisplay} ${t("report.exportDaysUnit")}`;
+      if (isAllSegment) {
+        return [
+          emp.name,
+          emp.role,
+          fmtHours(m.workedHoursMonth),
+          fmtHours(m.paidWorkedHoursMonth),
+          fmtMoney(m.payMonthAdjusted),
+          fmtMoney(m.paidMonthAmount),
+          fmtMoney(m.payMonthRemaining),
+          displayFilial(emp),
+        ];
+      }
+      return [
+        emp.name,
+        emp.role,
+        rateText,
+        fmtHours(m.reportHoursDisplay),
+        fmtMoney(m.reportPayDisplay),
+        daysText,
+        displayFilial(emp),
+        m.hasOverride ? t("common.yes") : "—",
+      ];
+    });
+    const branchMeta =
+      filialFilter === "all" ? t("report.exportAllBranches") : String(filialFilter);
+    const metaPairs = [
+      [t("report.exportMetaMonth"), formatMonthHeading(salaryReportMonth, locale)],
+      [t("report.exportMetaRange"), `${formatAttendanceDate(rf, locale)} — ${formatAttendanceDate(rt, locale)}`],
+      [t("report.exportMetaBranchFilter"), branchMeta],
+      [t("report.exportMetaSegment"), segmentLabel(salaryReportSegment)],
+      [t("report.exportMetaRowCount"), String(dataRows.length)],
+    ];
+
+    const COLS = headerLabels.length;
+    const borderThin = {
+      top: { style: "thin", color: { argb: "FFCBD5E1" } },
+      left: { style: "thin", color: { argb: "FFCBD5E1" } },
+      bottom: { style: "thin", color: { argb: "FFCBD5E1" } },
+      right: { style: "thin", color: { argb: "FFCBD5E1" } },
+    };
+    const fillHeader = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF5D6DF2" },
+    };
+    const fillMetaLabel = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FFE8ECFE" },
+    };
+    const fillMetaValue = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FFF8FAFC" },
+    };
+    const fillZebra = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FFF1F5F9" },
+    };
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "RestoControl";
+    const sheetName = String(t("report.exportSheetName") || "Hisobot").slice(0, 31);
+    const ws = wb.addWorksheet(sheetName, {
+      views: [{ showGridLines: true }],
+    });
+    ws.columns = isAllSegment
+      ? [
+          { width: 22 },
+          { width: 14 },
+          { width: 14 },
+          { width: 14 },
+          { width: 18 },
+          { width: 18 },
+          { width: 18 },
+          { width: 15 },
+        ]
+      : [
+          { width: 20 },
+          { width: 13 },
+          { width: 17 },
+          { width: 13 },
+          { width: 18 },
+          { width: 11 },
+          { width: 14 },
+          { width: 11 },
+        ];
+
+    let r = 1;
+    const title = ws.getRow(r);
+    title.getCell(1).value = t("report.salaryReportLine");
+    title.getCell(1).font = { name: "Calibri", size: 14, bold: true, color: { argb: "FF0F172A" } };
+    title.getCell(1).alignment = { vertical: "middle", horizontal: "left" };
+    ws.mergeCells(r, 1, r, COLS);
+    title.height = 24;
+    r += 1;
+
+    const sub = ws.getRow(r);
+    sub.getCell(1).value = `${formatMonthHeading(salaryReportMonth, locale)} · ${formatAttendanceDate(rf, locale)} — ${formatAttendanceDate(rt, locale)}`;
+    sub.getCell(1).font = { name: "Calibri", size: 10, color: { argb: "FF64748B" } };
+    ws.mergeCells(r, 1, r, COLS);
+    sub.height = 18;
+    r += 1;
+
+    for (const [label, value] of metaPairs) {
+      const row = ws.getRow(r);
+      const c1 = row.getCell(1);
+      const c2 = row.getCell(2);
+      c1.value = label;
+      c2.value = value;
+      c1.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FF334155" } };
+      c2.font = { name: "Calibri", size: 11, color: { argb: "FF0F172A" } };
+      c1.fill = fillMetaLabel;
+      c2.fill = fillMetaValue;
+      c1.border = borderThin;
+      c2.border = borderThin;
+      c1.alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+      c2.alignment = { vertical: "middle", horizontal: "left", wrapText: true, indent: 1 };
+      ws.mergeCells(r, 2, r, COLS);
+      row.height = 18;
+      r += 1;
+    }
+
+    const tableHeaderRowIndex = r;
+    const hRow = ws.getRow(r);
+    headerLabels.forEach((text, i) => {
+      const c = hRow.getCell(i + 1);
+      c.value = text;
+      c.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FFFFFFFF" } };
+      c.fill = fillHeader;
+      c.border = borderThin;
+      c.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+    });
+    hRow.height = 24;
+    r += 1;
+
+    const fillPayAccent = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FFF0FDF4" },
+    };
+
+    dataRows.forEach((cells, idx) => {
+      const row = ws.getRow(r);
+      cells.forEach((val, i) => {
+        const c = row.getCell(i + 1);
+        c.value = val;
+        c.font = { name: "Calibri", size: 11, color: { argb: "FF0F172A" } };
+        c.border = borderThin;
+        const isNumericStyleCol = i >= 2 && i <= (isAllSegment ? 6 : 5);
+        c.alignment = {
+          vertical: "middle",
+          horizontal: isNumericStyleCol ? "right" : "left",
+          wrapText: true,
+          indent: isNumericStyleCol ? 0 : 1,
+        };
+        if (i === 4 || (isAllSegment && (i === 5 || i === 6))) {
+          c.fill = fillPayAccent;
+          c.font = { name: "Calibri", size: 11, bold: true, color: { argb: "FF14532D" } };
+        } else if (idx % 2 === 1) c.fill = fillZebra;
+      });
+      row.height = 18;
+      r += 1;
+    });
+
+    ws.views = [{ state: "frozen", ySplit: tableHeaderRowIndex, showGridLines: true }];
+
+    const buffer = await wb.xlsx.writeBuffer();
+    const fname = `Hisobot_${salaryReportMonth}_${rf}_${rt}.xlsx`.replace(/[:/?*\\[\]]/g, "-");
+    const blob = new Blob([buffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [
+    activeMenu,
+    filteredEmployees,
+    hisobotRowCtx,
+    salaryReportMonth,
+    salaryReportRangeFrom,
+    salaryReportRangeTo,
+    salaryReportSegment,
+    filialFilter,
+    locale,
+    t,
+    fmtMoney,
+    fmtHours,
+  ]);
+
   const reportDetailData = useMemo(() => {
     if (!reportDetailEmployee) return null;
     const empFilial = getEmployeeFilialRaw(reportDetailEmployee);
@@ -1825,6 +2373,15 @@ function App() {
           }
         : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
 
+    const daysAll = eachDateStrInMonth(reportDetailMonth);
+    const detailClip =
+      reportDetailMonth === salaryReportMonth
+        ? clampSalaryReportRange(salaryReportMonth, salaryReportRangeFrom, salaryReportRangeTo)
+        : {
+            from: daysAll[0] || `${reportDetailMonth}-01`,
+            to: daysAll[daysAll.length - 1] || `${reportDetailMonth}-01`,
+          };
+
     const salaryItems = [];
     const fineItems = [];
     const bonusItems = [];
@@ -1836,6 +2393,7 @@ function App() {
       if (!sameEmployeeId(p.employeeId, reportDetailEmployee.id)) continue;
       const d = toAttendanceDateKey(p.date);
       if (!d || !d.startsWith(reportDetailMonth)) continue;
+      if (d < detailClip.from || d > detailClip.to) continue;
       const amt = Number(p.amount);
       if (!Number.isFinite(amt) || amt <= 0) continue;
       paidByDate.set(d, (paidByDate.get(d) || 0) + Math.trunc(amt));
@@ -1847,6 +2405,7 @@ function App() {
       salaryPolicyEmployeeOverrides
     );
     for (const dateStr of eachDateStrInMonth(reportDetailMonth)) {
+      if (dateStr < detailClip.from || dateStr > detailClip.to) continue;
       const att = getEmployeeAttendance(reportDetailEmployee, attendanceRecords, dateStr, reportGrace);
       const shift = getShiftForDate(reportDetailEmployee, dateStr);
       const pay = getEmployeeEarnedSalary(
@@ -1916,7 +2475,7 @@ function App() {
     const manualAdjustments = (salaryAdjustments || []).filter((x) => {
       if (!sameEmployeeId(x.employeeId, reportDetailEmployee.id)) return false;
       const d = toAttendanceDateKey(x.date);
-      return !!d && d.startsWith(reportDetailMonth);
+      return !!d && d.startsWith(reportDetailMonth) && d >= detailClip.from && d <= detailClip.to;
     });
     for (const adj of manualAdjustments) {
       const date = toAttendanceDateKey(adj.date);
@@ -2023,6 +2582,9 @@ function App() {
     salaryCalcDefaultConfig,
     salaryPolicy,
     salaryPolicyEmployeeOverrides,
+    salaryReportMonth,
+    salaryReportRangeFrom,
+    salaryReportRangeTo,
   ]);
 
   const getSalaryCalcConfigForEmployee = useCallback((employee) => {
@@ -2048,6 +2610,78 @@ function App() {
     salaryCalcDefaultConfig,
   ]);
 
+  const formatCalendarDayAmount = useCallback(
+    (n) => `${Math.trunc(Number(n) || 0).toLocaleString(localeToBcp47(locale))}so'm`,
+    [locale]
+  );
+
+  const hisobotMonthDayAmounts = useMemo(() => {
+    if (activeMenu !== "Hisobot") return undefined;
+    const ym = salaryReportMonth;
+    const manage =
+      userRole === "superadmin" || (userRole === "admin" && !adminSubLocked);
+    const list = manage ? employeesAfterCardFilter : employeesInScope;
+    const map = Object.create(null);
+    for (const dateStr of eachDateStrInMonth(ym)) {
+      let sum = 0;
+      for (const emp of list) {
+        const g = resolveLateGraceForEmployee(emp, salaryPolicy, salaryPolicyEmployeeOverrides);
+        const att = getEmployeeAttendance(emp, attendanceRecords, dateStr, g);
+        const cfg = getSalaryCalcConfigForEmployee(emp);
+        sum += getEmployeeEarnedSalary(emp, dateStr, att, roleSalaries, employeeSalaryOverrides, cfg);
+      }
+      const t = Math.max(0, Math.trunc(sum));
+      if (t > 0) map[dateStr] = t;
+    }
+    return map;
+  }, [
+    activeMenu,
+    salaryReportMonth,
+    userRole,
+    adminSubLocked,
+    employeesAfterCardFilter,
+    employeesInScope,
+    attendanceRecords,
+    salaryPolicy,
+    salaryPolicyEmployeeOverrides,
+    getSalaryCalcConfigForEmployee,
+    roleSalaries,
+    employeeSalaryOverrides,
+  ]);
+
+  const dashboardMonthDayAmounts = useMemo(() => {
+    if (activeMenu !== "Dashboard") return undefined;
+    const ym = dashboardMonth;
+    const scopedEmployees =
+      dashboardFilial === "all"
+        ? employeesInScope
+        : employeesInScope.filter((e) => (getEmployeeFilialRaw(e) || "Asosiy filial") === dashboardFilial);
+    const map = Object.create(null);
+    for (const dateStr of eachDateStrInMonth(ym)) {
+      let sum = 0;
+      for (const emp of scopedEmployees) {
+        const g = resolveLateGraceForEmployee(emp, salaryPolicy, salaryPolicyEmployeeOverrides);
+        const att = getEmployeeAttendance(emp, attendanceRecords, dateStr, g);
+        const cfg = getSalaryCalcConfigForEmployee(emp);
+        sum += getEmployeeEarnedSalary(emp, dateStr, att, roleSalaries, employeeSalaryOverrides, cfg);
+      }
+      const t = Math.max(0, Math.trunc(sum));
+      if (t > 0) map[dateStr] = t;
+    }
+    return map;
+  }, [
+    activeMenu,
+    dashboardMonth,
+    dashboardFilial,
+    employeesInScope,
+    attendanceRecords,
+    salaryPolicy,
+    salaryPolicyEmployeeOverrides,
+    getSalaryCalcConfigForEmployee,
+    roleSalaries,
+    employeeSalaryOverrides,
+  ]);
+
   const massPayPrepared = useMemo(() => {
     if (activeMenu !== "Hisobot") return { rows: [], entries: [], total: 0, days: 0, dueTotal: 0 };
     const fromDate = String(massPayDateFrom || "").slice(0, 10);
@@ -2060,7 +2694,7 @@ function App() {
     const paidByEmpDate = new Map();
     for (const p of salaryPayments || []) {
       const d = toAttendanceDateKey(p.date);
-      if (!d || !d.startsWith(salaryReportMonth)) continue;
+      if (!d || d < rangeStart || d > rangeEnd) continue;
       const k = `${p.employeeId}|${d}`;
       const amt = Number(p.amount);
       if (!Number.isFinite(amt) || amt <= 0) continue;
@@ -2386,7 +3020,7 @@ function App() {
 
   useEffect(() => {
     setSalaryReportSegment("all");
-  }, [salaryReportMonth]);
+  }, [salaryReportMonth, salaryReportRangeFrom, salaryReportRangeTo]);
 
   const stats = useMemo(() => {
     const list = employeesInScope.map((employee) => {
@@ -3235,11 +3869,15 @@ function App() {
     setTerminalProbeName("");
   }
 
+  function closeTerminalSyncResultModal() {
+    setTerminalSyncResultModal({ open: false, message: "", isError: false });
+  }
+
   async function pullEmployeesFromTerminals() {
-    if (userRole !== "admin") return;
+    if (userRole !== "admin" && userRole !== "superadmin") return;
     setTerminalSyncBusy(true);
     try {
-      const r = await api.syncAllTerminalsEmployees();
+      const r = await api.generateEmployeesFromTerminals();
       const d = await api.bootstrap();
       if (d?.employees) {
         setEmployees(Array.isArray(d.employees) ? d.employees.map(migrateEmployeeSchedule) : []);
@@ -3247,18 +3885,24 @@ function App() {
       if (d?.attendanceRecords) {
         setAttendanceRecords(Array.isArray(d.attendanceRecords) ? d.attendanceRecords : []);
       }
-      window.alert(
-        t("employees.terminalSyncSummary", {
+      setTerminalSyncResultModal({
+        open: true,
+        isError: false,
+        message: t("employees.terminalSyncSummary", {
           created: r.created ?? 0,
           updated: r.updated ?? 0,
           terminals: r.terminalCount ?? 0,
           scanned: r.scannedTotal ?? 0,
           pages: r.pagesTotal ?? 0,
           enriched: r.enrichedTotal ?? 0,
-        })
-      );
+        }),
+      });
     } catch (err) {
-      window.alert(translateApiError(err instanceof Error ? err.message : String(err), locale));
+      setTerminalSyncResultModal({
+        open: true,
+        isError: true,
+        message: translateApiError(err instanceof Error ? err.message : String(err), locale),
+      });
     } finally {
       setTerminalSyncBusy(false);
     }
@@ -3273,18 +3917,24 @@ function App() {
       if (d?.employees) {
         setEmployees(Array.isArray(d.employees) ? d.employees.map(migrateEmployeeSchedule) : []);
       }
-      window.alert(
-        t("employees.terminalSyncSummarySingle", {
+      setTerminalSyncResultModal({
+        open: true,
+        isError: false,
+        message: t("employees.terminalSyncSummarySingle", {
           created: r.created ?? 0,
           updated: r.updated ?? 0,
           total: r.total ?? 0,
           scanned: r.scanned ?? 0,
           pages: r.pages ?? 0,
           enriched: r.enriched ?? 0,
-        })
-      );
+        }),
+      });
     } catch (err) {
-      window.alert(translateApiError(err instanceof Error ? err.message : String(err), locale));
+      setTerminalSyncResultModal({
+        open: true,
+        isError: true,
+        message: translateApiError(err instanceof Error ? err.message : String(err), locale),
+      });
     } finally {
       setTerminalTableSyncBusyId(null);
     }
@@ -3360,6 +4010,20 @@ function App() {
     (activeMenu === "Hodimlar" && canManageEmployees) || (activeMenu === "Hisobot" && (isHodim || canManageEmployees));
   const showHodimlarWorkActions = activeMenu === "Hodimlar" && canManageEmployees;
 
+  const sidebarMenuItems =
+    userRole === "superadmin"
+      ? ["Adminlar", "Terminallar", "Baza", "Sozlamalar"]
+      : isHodim
+        ? menuItems.filter((i) => i !== "Hodimlar")
+        : menuItems;
+
+  const mobileScreenTitle =
+    activeMenu === "Bildirishnoma"
+      ? t("menu.notice")
+      : menuI18nPath(activeMenu)
+        ? t(menuI18nPath(activeMenu))
+        : activeMenu;
+
   const dbTableCfg = Array.isArray(dbMeta?.tables) ? dbMeta.tables.find((t) => t.name === dbTable) : null;
   const dbPkName = dbTableCfg?.pk?.name || "";
   const dbAllPkVals = dbPkName && Array.isArray(dbRows) ? dbRows.map((r) => r?.[dbPkName]).filter((x) => x != null).map((x) => String(x)) : [];
@@ -3367,6 +4031,41 @@ function App() {
 
   return (
     <div className={`page theme-${theme} ui-${uiDensity}`}>
+      <header className="mobile-app-header">
+        <div className="mobile-app-header-brand">
+          <img src={brandLogo} alt="" className="mobile-app-header-logo" width={36} height={36} />
+          <div className="mobile-app-header-text">
+            <span className="mobile-app-header-kicker">RestoControl</span>
+            <span className="mobile-app-header-title">{mobileScreenTitle}</span>
+          </div>
+        </div>
+        <div className="mobile-app-header-actions">
+          <button
+            type="button"
+            className="mobile-header-icon-btn mobile-header-icon-btn--notice"
+            aria-label={t("menu.notice")}
+            title={t("menu.notice")}
+            onClick={() => setActiveMenu("Bildirishnoma")}
+          >
+            <Bell size={18} strokeWidth={2} />
+            {unreadSubscriptionNoticeCount > 0 ? (
+              <span className="mobile-header-notice-badge">
+                {unreadSubscriptionNoticeCount > 99 ? "99+" : unreadSubscriptionNoticeCount}
+              </span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            className="mobile-header-icon-btn mobile-header-icon-btn--logout"
+            aria-label={t("sidebar.logout")}
+            title={t("sidebar.logout")}
+            onClick={logout}
+          >
+            <LogOut size={18} strokeWidth={2} />
+          </button>
+        </div>
+      </header>
+
       <aside className="sidebar scroll-modern">
         <div>
           <div className="profile">
@@ -3380,31 +4079,25 @@ function App() {
           </div>
           <div className="sidebar-divider" aria-hidden="true" />
 
-          <nav className="menu">
-              {(
-                userRole === "superadmin"
-                  ? ["Adminlar", "Terminallar", "Baza", "Sozlamalar"]
-                  : isHodim
-                    ? menuItems.filter((i) => i !== "Hodimlar")
-                    : menuItems
-              ).map((item) => {
-                const Icon = menuIcons[item] || LayoutDashboard;
-                const path = menuI18nPath(item);
-                return (
-                  <button
-                    key={item}
-                    className={`menu-item ${activeMenu === item ? "active" : ""}`}
-                    type="button"
-                    onClick={() => setActiveMenu(item)}
-                  >
-                    <Icon size={14} />
-                    {path ? t(path) : item}
-                    <span className="right">
-                      <ChevronRight size={14} />
-                    </span>
-                  </button>
-                );
-              })}
+          <nav className="menu" aria-label={t("common.mobileMainNav")}>
+            {sidebarMenuItems.map((item) => {
+              const Icon = menuIcons[item] || LayoutDashboard;
+              const path = menuI18nPath(item);
+              return (
+                <button
+                  key={item}
+                  className={`menu-item ${activeMenu === item ? "active" : ""}`}
+                  type="button"
+                  onClick={() => setActiveMenu(item)}
+                >
+                  <Icon size={14} />
+                  {path ? t(path) : item}
+                  <span className="right">
+                    <ChevronRight size={14} />
+                  </span>
+                </button>
+              );
+            })}
           </nav>
         </div>
 
@@ -3429,7 +4122,15 @@ function App() {
         </div>
       </aside>
 
-      <main className="content scroll-modern">
+      <main
+        className={`content scroll-modern${
+          activeMenu === "Hodimlar"
+            ? " content-view-hodimlar"
+            : activeMenu === "Hisobot"
+              ? " content-view-hisobot"
+              : ""
+        }`}
+      >
         {activeMenu === "Hodimlar" || activeMenu === "Hisobot" ? (
           <section className="heading-row">
             <div className="heading-titles">
@@ -3446,6 +4147,12 @@ function App() {
                 <p className="page-subtitle">
                   <Wallet size={14} strokeWidth={1.75} className="page-subtitle-icon" aria-hidden />
                   {formatMonthHeading(salaryReportMonth, locale)}
+                  {hisobotReportRangeSubtitle ? (
+                    <>
+                      <span className="page-subtitle-sep"> · </span>
+                      <span className="page-subtitle-muted">{hisobotReportRangeSubtitle}</span>
+                    </>
+                  ) : null}
                   <span className="page-subtitle-sep"> · </span>
                   <span className="page-subtitle-muted">{t("report.salaryReportLine")}</span>
                 </p>
@@ -3465,6 +4172,7 @@ function App() {
                   </button>
                   {userRole === "admin" ? (
                     <button
+                      id="addEmployeeIconBtn"
                       className="employees-toolbar-sync-btn"
                       type="button"
                       disabled={terminalSyncBusy || terminalTableSyncBusyId != null}
@@ -3475,9 +4183,8 @@ function App() {
                       {terminalSyncBusy ? (
                         <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
                       ) : (
-                        <Download size={15} strokeWidth={2} aria-hidden />
+                        <UserPlus size={15} strokeWidth={2} aria-hidden />
                       )}
-                      <span>{t("terminal.syncAllShort")}</span>
                     </button>
                   ) : null}
                   <select
@@ -3508,21 +4215,29 @@ function App() {
                       setMassPayFilial(filialFilter);
                       setMassPayOnlyDebtors(true);
                       setMassPaySelectedEmployeeIds([]);
-                      const monthDays = eachDateStrInMonth(salaryReportMonth);
-                      setMassPayDateFrom(`${salaryReportMonth}-01`);
-                      setMassPayDateTo(monthDays.length > 0 ? monthDays[monthDays.length - 1] : `${salaryReportMonth}-01`);
+                      setMassPayDateFrom(salaryReportRangeFrom);
+                      setMassPayDateTo(salaryReportRangeTo);
                     }}
                     aria-label={t("report.massPayOpenAria")}
                     title={t("report.massPayOpenAria")}
                   >
                     <Wallet size={15} strokeWidth={1.75} />
                   </button>
-                  <input
+                  <ReportMonthPicker
                     className="date-input report-month-input"
-                    type="month"
-                    aria-label={t("report.monthFieldAria")}
+                    variant="range"
                     value={salaryReportMonth}
-                    onChange={(e) => setSalaryReportMonth(e.target.value)}
+                    rangeFrom={salaryReportRangeFrom}
+                    rangeTo={salaryReportRangeTo}
+                    onRangeCommit={({ month, from, to }) => {
+                      setSalaryReportMonth(month);
+                      setSalaryReportRangeFrom(from);
+                      setSalaryReportRangeTo(to);
+                    }}
+                    locale={locale}
+                    ariaLabel={t("report.monthFieldAria")}
+                    dayAmounts={hisobotMonthDayAmounts}
+                    formatDayAmount={formatCalendarDayAmount}
                   />
                   <select
                     className="date-input filial-filter"
@@ -3537,18 +4252,43 @@ function App() {
                       </option>
                     ))}
                   </select>
+                  <button
+                    className="filters-salary-btn report-export-btn"
+                    type="button"
+                    onClick={() => void exportHisobotExcel()}
+                    aria-label={t("report.exportExcelAria")}
+                    title={t("report.exportExcelAria")}
+                  >
+                    <Download size={15} strokeWidth={2} aria-hidden />
+                  </button>
                 </div>
               </div>
             ) : isHodim && activeMenu === "Hisobot" ? (
               <div className="content-toolbar">
                 <div className="filters filters-report-bar filters-salary-report">
-                  <input
+                  <ReportMonthPicker
                     className="date-input report-month-input"
-                    type="month"
-                    aria-label={t("report.monthFieldAria")}
                     value={salaryReportMonth}
-                    onChange={(e) => setSalaryReportMonth(e.target.value)}
+                    onChange={(ym) => {
+                      setSalaryReportMonth(ym);
+                      const b = salaryReportMonthBounds(ym);
+                      setSalaryReportRangeFrom(b.from);
+                      setSalaryReportRangeTo(b.to);
+                    }}
+                    locale={locale}
+                    ariaLabel={t("report.monthFieldAria")}
+                    dayAmounts={hisobotMonthDayAmounts}
+                    formatDayAmount={formatCalendarDayAmount}
                   />
+                  <button
+                    className="filters-salary-btn report-export-btn"
+                    type="button"
+                    onClick={() => void exportHisobotExcel()}
+                    aria-label={t("report.exportExcelAria")}
+                    title={t("report.exportExcelAria")}
+                  >
+                    <Download size={15} strokeWidth={2} aria-hidden />
+                  </button>
                 </div>
               </div>
             ) : null}
@@ -3734,109 +4474,16 @@ function App() {
                 </thead>
                 <tbody>
                   {filteredEmployees.map((employee) => {
-                    const empFilial = getEmployeeFilialRaw(employee);
-                    const cfg =
-                      empFilial === salaryCalcSelectedFilial
-                        ? {
-                            weekMode: salaryCalcWeekMode,
-                            weekFixed: salaryCalcWeekFixed,
-                            monthMode: salaryCalcMonthMode,
-                            monthFixed: salaryCalcMonthFixed,
-                            attendanceMode: salaryCalcAttendanceMode,
-                          }
-                        : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
-                    const rowGrace = resolveLateGraceForEmployee(employee, salaryPolicy, salaryPolicyEmployeeOverrides);
-                    const attendance = getEmployeeAttendance(employee, attendanceRecords, selectedDate, rowGrace);
-                    const rate = getEmployeeSalary(employee, roleSalaries, employeeSalaryOverrides);
-                    const hasOverride = employeeSalaryOverrides[String(employee.id)] != null;
-                    const payDay = getEmployeeEarnedSalary(
-                      employee,
-                      selectedDate,
-                      attendance,
-                      roleSalaries,
-                      employeeSalaryOverrides,
-                      cfg
-                    );
-                    const payMonth = sumEarnedSalaryInMonth(
-                      employee,
-                      salaryReportMonth,
-                      attendanceRecords,
-                      roleSalaries,
-                      employeeSalaryOverrides,
-                      cfg
-                    );
-                    const paidMonthAmount = (salaryPayments || []).reduce((acc, p) => {
-                      if (!sameEmployeeId(p.employeeId, employee.id)) return acc;
-                      const d = toAttendanceDateKey(p.date);
-                      if (!d || !d.startsWith(salaryReportMonth)) return acc;
-                      const amt = Number(p.amount);
-                      return acc + (Number.isFinite(amt) ? Math.max(0, Math.trunc(amt)) : 0);
-                    }, 0);
-                    const bonusByDate = new Map();
-                    const fineByDate = new Map();
-                    const advanceByDate = new Map();
-                    for (const adj of salaryAdjustments || []) {
-                      if (!sameEmployeeId(adj.employeeId, employee.id)) continue;
-                      const d = toAttendanceDateKey(adj.date);
-                      if (!d || !d.startsWith(salaryReportMonth)) continue;
-                      const amt = Math.max(0, Math.trunc(Number(adj.amount) || 0));
-                      const kind = normalizeAdjustmentKind(adj.kind);
-                      if (kind === "fine") fineByDate.set(d, (fineByDate.get(d) || 0) + amt);
-                      else if (kind === "advance") advanceByDate.set(d, (advanceByDate.get(d) || 0) + amt);
-                      else if (kind === "bonus") bonusByDate.set(d, (bonusByDate.get(d) || 0) + amt);
-                    }
-                    let bonusMonth = 0;
-                    let fineMonth = 0;
-                    let advanceMonth = 0;
-                    for (const v of bonusByDate.values()) bonusMonth += v;
-                    for (const v of fineByDate.values()) fineMonth += v;
-                    for (const v of advanceByDate.values()) advanceMonth += v;
-                    const payMonthAdjusted = Math.max(0, payMonth + bonusMonth - fineMonth - advanceMonth);
-                    const payMonthRemaining = Math.max(0, payMonthAdjusted - paidMonthAmount);
-                    const isPaidSegment = salaryReportSegment === "with_pay" || salaryReportSegment === "finished";
-                    const reportPayDisplay = isPaidSegment ? payMonthAdjusted : payMonthRemaining;
-                    let remainingDaysInMonth = 0;
-                    let paidDaysInMonth = 0;
-                    let remainingWorkedHoursMonth = 0;
-                    for (const dateStr of eachDateStrInMonth(salaryReportMonth)) {
-                      const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, 5);
-                      const dayPay = getEmployeeEarnedSalary(
-                        employee,
-                        dateStr,
-                        att,
-                        roleSalaries,
-                        employeeSalaryOverrides,
-                        cfg
-                      );
-                      if (dayPay <= 0) continue;
-                      const paidDateAmount = (salaryPayments || []).reduce((acc, p) => {
-                        if (!sameEmployeeId(p.employeeId, employee.id)) return acc;
-                        if (toAttendanceDateKey(p.date) !== dateStr) return acc;
-                        const amt = Number(p.amount);
-                        return acc + (Number.isFinite(amt) ? Math.max(0, Math.trunc(amt)) : 0);
-                      }, 0);
-                      const bonusDay = bonusByDate.get(dateStr) || 0;
-                      const fineDay = fineByDate.get(dateStr) || 0;
-                      const advanceDay = advanceByDate.get(dateStr) || 0;
-                      const adjustedDayPay = Math.max(0, dayPay + bonusDay - fineDay - advanceDay);
-                      const remainingDayPay = adjustedDayPay - paidDateAmount;
-                      if (remainingDayPay > 0) {
-                        remainingDaysInMonth += 1;
-                        remainingWorkedHoursMonth += getWorkedHoursOnDay(employee, dateStr, att, cfg?.attendanceMode);
-                      } else if (paidDateAmount > 0) {
-                        paidDaysInMonth += 1;
-                      }
-                    }
-                    const workedHoursMonth = sumWorkedHoursInMonth(
-                      employee,
-                      salaryReportMonth,
-                      attendanceRecords,
-                      cfg?.attendanceMode
-                    );
-                    const reportHoursDisplay = isPaidSegment ? workedHoursMonth : remainingWorkedHoursMonth;
-                    const reportDaysDisplay = isPaidSegment ? paidDaysInMonth : remainingDaysInMonth;
-
                     if (activeMenu === "Hisobot") {
+                      const {
+                        repFrom,
+                        repTo,
+                        rate,
+                        hasOverride,
+                        reportHoursDisplay,
+                        reportPayDisplay,
+                        reportDaysDisplay,
+                      } = computeHisobotTableRowMetrics(employee, hisobotRowCtx);
                       return (
                         <tr
                           key={employee.id}
@@ -3844,9 +4491,12 @@ function App() {
                           onClick={() => {
                             setReportDetailEmployee(employee);
                             setReportDetailMonth(salaryReportMonth);
-                            const seedDate = selectedDate.startsWith(salaryReportMonth)
-                              ? selectedDate
-                              : `${salaryReportMonth}-01`;
+                            const seedDate =
+                              selectedDate >= repFrom &&
+                              selectedDate <= repTo &&
+                              selectedDate.startsWith(salaryReportMonth)
+                                ? selectedDate
+                                : repFrom;
                             setReportDetailSelectedDate(seedDate);
                           }}
                         >
@@ -3875,6 +4525,29 @@ function App() {
                       );
                     }
 
+                    const empFilial = getEmployeeFilialRaw(employee);
+                    const cfg =
+                      empFilial === salaryCalcSelectedFilial
+                        ? {
+                            weekMode: salaryCalcWeekMode,
+                            weekFixed: salaryCalcWeekFixed,
+                            monthMode: salaryCalcMonthMode,
+                            monthFixed: salaryCalcMonthFixed,
+                            attendanceMode: salaryCalcAttendanceMode,
+                          }
+                        : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
+                    const rowGrace = resolveLateGraceForEmployee(employee, salaryPolicy, salaryPolicyEmployeeOverrides);
+                    const attendance = getEmployeeAttendance(employee, attendanceRecords, selectedDate, rowGrace);
+                    const rate = getEmployeeSalary(employee, roleSalaries, employeeSalaryOverrides);
+                    const hasOverride = employeeSalaryOverrides[String(employee.id)] != null;
+                    const payDay = getEmployeeEarnedSalary(
+                      employee,
+                      selectedDate,
+                      attendance,
+                      roleSalaries,
+                      employeeSalaryOverrides,
+                      cfg
+                    );
                     const pay = payDay;
                     return (
                       <tr
@@ -4090,7 +4763,7 @@ function App() {
               <div className="journal-top-row">
                 <h3 className="journal-title">{t("terminal.pageTitle")}</h3>
                 <div className="terminal-page-toolbar-btns">
-                  {userRole === "admin" ? (
+                  {userRole === "admin" || userRole === "superadmin" ? (
                     <button
                       type="button"
                       className="terminal-toolbar-sync-btn"
@@ -4145,21 +4818,23 @@ function App() {
                         <td>{row.password || "—"}</td>
                         <td>
                           <div className="terminal-actions-cell">
-                            <button
-                              type="button"
-                              className="terminal-row-action-btn"
-                              aria-label={t("terminal.testConnectionAria")}
-                              title={t("terminal.testConnection")}
-                              disabled={terminalProbeBusy}
-                              onClick={() => runTerminalConnectionTest(row)}
-                            >
-                              {terminalProbeBusy && terminalProbeTargetId === row.id ? (
-                                <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
-                              ) : (
-                                <Wifi size={15} strokeWidth={2} aria-hidden />
-                              )}
-                              <span>{t("terminal.actionProbeShort")}</span>
-                            </button>
+                            {userRole === "superadmin" ? (
+                              <button
+                                type="button"
+                                className="terminal-row-action-btn terminal-row-action-btn--probe"
+                                aria-label={t("terminal.testConnectionAria")}
+                                title={t("terminal.testConnection")}
+                                disabled={terminalProbeBusy}
+                                onClick={() => runTerminalConnectionTest(row)}
+                              >
+                                {terminalProbeBusy && terminalProbeTargetId === row.id ? (
+                                  <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
+                                ) : (
+                                  <Wifi size={15} strokeWidth={2} aria-hidden />
+                                )}
+                                <span>{t("terminal.actionProbeShort")}</span>
+                              </button>
+                            ) : null}
                             <button
                               type="button"
                               className="terminal-row-action-btn terminal-row-action-btn--sync"
@@ -5025,23 +5700,26 @@ function App() {
               ) : activeMenu === "Dashboard" ? (
                 <div className="dashboard-page">
                   <section className="dashboard-hero">
-                    <div>
+                    <div className="dashboard-hero-inner">
                       <h2>{t("menu.dashboard")}</h2>
                       <p>
                         {formatMonthHeading(dashboardMonth, locale)} · {dashboardFilial === "all" ? t("common.allBranches") : dashboardFilial}
                       </p>
-                    </div>
-                    <div className="dashboard-hero-progress">
-                      <span>{t("dashboard.payCompletion")}</span>
-                      <strong>{dashboardData.paidPercent}%</strong>
+                      <div className="dashboard-hero-progress">
+                        <span>{t("dashboard.payCompletion")}</span>
+                        <strong>{dashboardData.paidPercent}%</strong>
+                      </div>
                     </div>
                   </section>
                   <section className="dashboard-filters">
-                    <input
+                    <ReportMonthPicker
                       className="date-input report-month-input"
-                      type="month"
                       value={dashboardMonth}
-                      onChange={(e) => setDashboardMonth(e.target.value)}
+                      onChange={setDashboardMonth}
+                      locale={locale}
+                      ariaLabel={t("report.monthFieldAria")}
+                      dayAmounts={dashboardMonthDayAmounts}
+                      formatDayAmount={formatCalendarDayAmount}
                     />
                     <select
                       className="date-input filial-filter"
@@ -5096,37 +5774,67 @@ function App() {
                   </section>
 
                   <section className="dashboard-live-row">
-                    <article className="dashboard-card dashboard-live-card">
-                      <h3>{t("dashboard.liveToday")}</h3>
+                    <article className="dashboard-card dashboard-live-card dashboard-spotlight-card">
+                      <div className="dashboard-card-head">
+                        <h3>{t("dashboard.liveToday")}</h3>
+                        <span className="dashboard-live-pulse" title="Live" aria-hidden />
+                      </div>
                       <div className="dashboard-live-meta">
-                        <span>{liveNow.toLocaleTimeString(localeToBcp47(locale), { hour: "2-digit", minute: "2-digit" })}</span>
-                        <strong>{t("dashboard.refreshEach10s")}</strong>
+                        <time className="dashboard-live-time" dateTime={liveNow.toISOString()}>
+                          {liveNow.toLocaleTimeString(localeToBcp47(locale), { hour: "2-digit", minute: "2-digit" })}
+                        </time>
+                        <span className="dashboard-live-refresh">{t("dashboard.refreshEach10s")}</span>
                       </div>
-                      <div className="dashboard-live-stats">
-                        <span>{t("dashboard.presentNow")}: {dashboardData.presentNow}</span>
-                        <span>{t("attendance.late")}: {dashboardData.stateCounts.late}</span>
-                        <span>{t("attendance.absent")}: {dashboardData.stateCounts.absent}</span>
-                      </div>
+                      <ul className="dashboard-live-stats">
+                        <li className="dashboard-live-stat dashboard-live-stat--present">
+                          <span className="dashboard-live-stat-label">{t("dashboard.presentNow")}</span>
+                          <span className="dashboard-live-stat-value">{dashboardData.presentNow}</span>
+                        </li>
+                        <li className="dashboard-live-stat dashboard-live-stat--late">
+                          <span className="dashboard-live-stat-label">{t("attendance.late")}</span>
+                          <span className="dashboard-live-stat-value">{dashboardData.stateCounts.late}</span>
+                        </li>
+                        <li className="dashboard-live-stat dashboard-live-stat--absent">
+                          <span className="dashboard-live-stat-label">{t("attendance.absent")}</span>
+                          <span className="dashboard-live-stat-value">{dashboardData.stateCounts.absent}</span>
+                        </li>
+                      </ul>
                     </article>
-                    <article className="dashboard-card dashboard-ring-card">
-                      <h3>{t("dashboard.dailyAttendanceProgress")}</h3>
-                      <div className="dashboard-ring-wrap">
-                        <div
-                          className="dashboard-ring"
-                          style={{
-                            background: `conic-gradient(#4f7dff 0 ${dashboardData.attendanceRing.present}%, #f59e0b ${dashboardData.attendanceRing.present}% ${dashboardData.attendanceRing.present + dashboardData.attendanceRing.late}%, #e5e7eb ${dashboardData.attendanceRing.present + dashboardData.attendanceRing.late}% 100%)`,
-                          }}
-                        >
-                          <div className="dashboard-ring-center">
-                            <strong>{dashboardData.attendanceRing.present}%</strong>
-                            <span>{t("dashboard.presentShort")}</span>
+                    <article className="dashboard-card dashboard-ring-card dashboard-spotlight-card">
+                      <div className="dashboard-card-head dashboard-card-head--solo">
+                        <h3>{t("dashboard.dailyAttendanceProgress")}</h3>
+                      </div>
+                      <div className="dashboard-ring-body">
+                        <div className="dashboard-ring-visual">
+                          <div
+                            className="dashboard-ring"
+                            style={{
+                              background: `conic-gradient(var(--dashboard-ring-present) 0% ${dashboardData.attendanceRing.present}%, var(--dashboard-ring-late) ${dashboardData.attendanceRing.present}% ${dashboardData.attendanceRing.present + dashboardData.attendanceRing.late}%, var(--dashboard-ring-absent) ${dashboardData.attendanceRing.present + dashboardData.attendanceRing.late}% 100%)`,
+                            }}
+                          >
+                            <div className="dashboard-ring-center">
+                              <strong>{dashboardData.attendanceRing.present}%</strong>
+                              <span>{t("dashboard.presentShort")}</span>
+                            </div>
                           </div>
                         </div>
-                        <div className="dashboard-ring-legend">
-                          <span>Kelgan {dashboardData.attendanceRing.present}%</span>
-                          <span>Kechikkan {dashboardData.attendanceRing.late}%</span>
-                          <span>Kelmagan {dashboardData.attendanceRing.absent}%</span>
-                        </div>
+                        <ul className="dashboard-ring-legend" aria-label={t("dashboard.dailyAttendanceProgress")}>
+                          <li className="dashboard-ring-legend-item dashboard-ring-legend-item--present">
+                            <span className="dashboard-ring-legend-dot" aria-hidden />
+                            <span className="dashboard-ring-legend-label">{t("attendance.present")}</span>
+                            <span className="dashboard-ring-legend-pct">{dashboardData.attendanceRing.present}%</span>
+                          </li>
+                          <li className="dashboard-ring-legend-item dashboard-ring-legend-item--late">
+                            <span className="dashboard-ring-legend-dot" aria-hidden />
+                            <span className="dashboard-ring-legend-label">{t("attendance.late")}</span>
+                            <span className="dashboard-ring-legend-pct">{dashboardData.attendanceRing.late}%</span>
+                          </li>
+                          <li className="dashboard-ring-legend-item dashboard-ring-legend-item--absent">
+                            <span className="dashboard-ring-legend-dot" aria-hidden />
+                            <span className="dashboard-ring-legend-label">{t("attendance.absent")}</span>
+                            <span className="dashboard-ring-legend-pct">{dashboardData.attendanceRing.absent}%</span>
+                          </li>
+                        </ul>
                       </div>
                     </article>
                   </section>
@@ -5245,6 +5953,26 @@ function App() {
           )
         ) : null}
       </main>
+
+      <nav className="mobile-bottom-nav" aria-label={t("common.mobileMainNav")}>
+        {sidebarMenuItems.map((item) => {
+          const Icon = menuIcons[item] || LayoutDashboard;
+          const path = menuI18nPath(item);
+          return (
+            <button
+              key={item}
+              type="button"
+              className={`mobile-bottom-nav-item ${activeMenu === item ? "active" : ""}`}
+              onClick={() => setActiveMenu(item)}
+            >
+              <span className="mobile-bottom-nav-icon-wrap" aria-hidden>
+                <Icon size={20} strokeWidth={activeMenu === item ? 2.25 : 2} />
+              </span>
+              <span className="mobile-bottom-nav-label">{path ? t(path) : item}</span>
+            </button>
+          );
+        })}
+      </nav>
 
       {reportDetailEmployee && reportDetailData ? (
         <div
@@ -5868,12 +6596,12 @@ function App() {
                       />
                     ) : null}
                     {attendanceHistoryAllFilterKind === "month" ? (
-                      <input
+                      <ReportMonthPicker
                         className="date-input report-month-input attendance-history-month"
-                        type="month"
-                        aria-label={t("attendance.monthAria")}
                         value={attendanceHistoryAllMonthValue}
-                        onChange={(e) => setAttendanceHistoryAllMonthValue(e.target.value)}
+                        onChange={setAttendanceHistoryAllMonthValue}
+                        locale={locale}
+                        ariaLabel={t("attendance.monthAria")}
                       />
                     ) : null}
                   </div>
@@ -6893,7 +7621,7 @@ function App() {
             aria-labelledby="terminal-probe-title"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="modal-header">
+            <div className="modal-header modal-header-terminal-probe">
               <h3 id="terminal-probe-title">{t("terminal.probeTitle")}</h3>
               <button
                 type="button"
@@ -6906,89 +7634,91 @@ function App() {
               </button>
             </div>
             <div className="modal-form terminal-probe-body">
-              <p className="terminal-probe-terminal-name">
-                <strong>{terminalProbeName}</strong>
-              </p>
-              {terminalProbeBusy ? (
-                <p className="salary-hint">{t("terminal.probeRunning")}</p>
-              ) : terminalProbeResult ? (
-                <>
-                  {terminalProbeResult.baseUrl ? (
-                    <p className="terminal-probe-base">
-                      <span className="terminal-probe-label">{t("terminal.probeBaseUrl")}:</span>{" "}
-                      <code className="terminal-probe-code">{terminalProbeResult.baseUrl}</code>
-                    </p>
-                  ) : null}
-                  {terminalProbeResult.error ? <p className="login-err">{terminalProbeResult.error}</p> : null}
-                  {terminalProbeResult.contextHint ? (
-                    <p className="salary-hint terminal-probe-context">{terminalProbeResult.contextHint}</p>
-                  ) : null}
-                  <ul className="terminal-probe-steps">
-                    {(terminalProbeResult.steps || []).map((s) => (
-                      <li
-                        key={s.id}
-                        className={`terminal-probe-step ${
-                          s.ok ? "terminal-probe-step-ok" : s.optional ? "terminal-probe-step-warn" : "terminal-probe-step-fail"
-                        }`}
-                      >
-                        <div className="terminal-probe-step-title">
-                          {s.id === "deviceInfo" ? t("terminal.probeStepDevice") : null}
-                          {s.id === "systemTime" ? t("terminal.probeStepTime") : null}
-                          {s.id === "accessControlCap" ? t("terminal.probeStepAcCap") : null}
-                          {s.id === "userInfoSearch" ? t("terminal.probeStepUser") : null}
-                          {s.id === "userInfoRecord" ? t("terminal.probeStepUserRecord") : null}
-                          {s.id === "acsEvent" ? t("terminal.probeStepEvents") : null}
-                          {!["deviceInfo", "systemTime", "accessControlCap", "userInfoSearch", "userInfoRecord", "acsEvent"].includes(
-                            s.id
-                          )
-                            ? s.id
-                            : null}
-                          {s.optional ? (
-                            <span className="terminal-probe-optional-badge">{t("terminal.probeOptional")}</span>
-                          ) : null}
-                        </div>
-                        <div className="terminal-probe-step-meta">
-                          {t("terminal.probeHttp", { status: s.httpStatus ?? "—" })}
-                          {s.id === "userInfoSearch" && s.userCount != null && s.userScanned != null ? (
-                            <span className="terminal-probe-step-count">
-                              {" · "}
-                              {t("terminal.probeUserSearchStats", {
-                                named: s.userCount,
-                                scanned: s.userScanned,
-                                pages: s.searchPages ?? 1,
-                                enriched: s.recordEnriched ?? 0,
-                              })}
-                            </span>
-                          ) : s.userCount != null ? (
-                            <span className="terminal-probe-step-count">
-                              {" · "}
-                              {t("terminal.probeUsersFound", { n: s.userCount })}
-                            </span>
-                          ) : null}
-                          {s.eventCount != null ? (
-                            <span className="terminal-probe-step-count">
-                              {" · "}
-                              {t("terminal.probeEventsFound", { n: s.eventCount })}
-                            </span>
-                          ) : null}
-                        </div>
-                        {s.hint ? <pre className="terminal-probe-hint">{s.hint}</pre> : null}
-                      </li>
-                    ))}
-                  </ul>
-                  {terminalProbeResult.ok ? (
-                    <>
-                      <p className="salary-hint terminal-probe-summary-ok">{t("terminal.probeSuccess")}</p>
-                      {terminalProbeResult.optionalFailed ? (
-                        <p className="salary-hint terminal-probe-optional-note">{t("terminal.probeSuccessOptionalNote")}</p>
-                      ) : null}
-                    </>
-                  ) : (terminalProbeResult.steps || []).length > 0 ? (
-                    <p className="login-err terminal-probe-summary-fail">{t("terminal.probePartial")}</p>
-                  ) : null}
-                </>
-              ) : null}
-              <div className="modal-actions">
+              <div className="terminal-probe-scroll">
+                <p className="terminal-probe-terminal-name">
+                  <strong>{terminalProbeName}</strong>
+                </p>
+                {terminalProbeBusy ? (
+                  <p className="salary-hint">{t("terminal.probeRunning")}</p>
+                ) : terminalProbeResult ? (
+                  <>
+                    {terminalProbeResult.baseUrl ? (
+                      <p className="terminal-probe-base">
+                        <span className="terminal-probe-label">{t("terminal.probeBaseUrl")}:</span>{" "}
+                        <code className="terminal-probe-code">{terminalProbeResult.baseUrl}</code>
+                      </p>
+                    ) : null}
+                    {terminalProbeResult.error ? <p className="login-err">{terminalProbeResult.error}</p> : null}
+                    {terminalProbeResult.contextHint ? (
+                      <p className="salary-hint terminal-probe-context">{terminalProbeResult.contextHint}</p>
+                    ) : null}
+                    <ul className="terminal-probe-steps">
+                      {(terminalProbeResult.steps || []).map((s) => (
+                        <li
+                          key={s.id}
+                          className={`terminal-probe-step ${
+                            s.ok ? "terminal-probe-step-ok" : s.optional ? "terminal-probe-step-warn" : "terminal-probe-step-fail"
+                          }`}
+                        >
+                          <div className="terminal-probe-step-title">
+                            {s.id === "deviceInfo" ? t("terminal.probeStepDevice") : null}
+                            {s.id === "systemTime" ? t("terminal.probeStepTime") : null}
+                            {s.id === "accessControlCap" ? t("terminal.probeStepAcCap") : null}
+                            {s.id === "userInfoSearch" ? t("terminal.probeStepUser") : null}
+                            {s.id === "userInfoRecord" ? t("terminal.probeStepUserRecord") : null}
+                            {s.id === "acsEvent" ? t("terminal.probeStepEvents") : null}
+                            {!["deviceInfo", "systemTime", "accessControlCap", "userInfoSearch", "userInfoRecord", "acsEvent"].includes(
+                              s.id
+                            )
+                              ? s.id
+                              : null}
+                            {s.optional ? (
+                              <span className="terminal-probe-optional-badge">{t("terminal.probeOptional")}</span>
+                            ) : null}
+                          </div>
+                          <div className="terminal-probe-step-meta">
+                            {t("terminal.probeHttp", { status: s.httpStatus ?? "—" })}
+                            {s.id === "userInfoSearch" && s.userCount != null && s.userScanned != null ? (
+                              <span className="terminal-probe-step-count">
+                                {" · "}
+                                {t("terminal.probeUserSearchStats", {
+                                  named: s.userCount,
+                                  scanned: s.userScanned,
+                                  pages: s.searchPages ?? 1,
+                                  enriched: s.recordEnriched ?? 0,
+                                })}
+                              </span>
+                            ) : s.userCount != null ? (
+                              <span className="terminal-probe-step-count">
+                                {" · "}
+                                {t("terminal.probeUsersFound", { n: s.userCount })}
+                              </span>
+                            ) : null}
+                            {s.eventCount != null ? (
+                              <span className="terminal-probe-step-count">
+                                {" · "}
+                                {t("terminal.probeEventsFound", { n: s.eventCount })}
+                              </span>
+                            ) : null}
+                          </div>
+                          {s.hint ? <pre className="terminal-probe-hint">{s.hint}</pre> : null}
+                        </li>
+                      ))}
+                    </ul>
+                    {terminalProbeResult.ok ? (
+                      <>
+                        <p className="salary-hint terminal-probe-summary-ok">{t("terminal.probeSuccess")}</p>
+                        {terminalProbeResult.optionalFailed ? (
+                          <p className="salary-hint terminal-probe-optional-note">{t("terminal.probeSuccessOptionalNote")}</p>
+                        ) : null}
+                      </>
+                    ) : (terminalProbeResult.steps || []).length > 0 ? (
+                      <p className="login-err terminal-probe-summary-fail">{t("terminal.probePartial")}</p>
+                    ) : null}
+                  </>
+                ) : null}
+              </div>
+              <div className="modal-actions modal-actions-terminal-probe">
                 <button
                   type="button"
                   className="modal-btn modal-btn-primary"
@@ -6998,6 +7728,50 @@ function App() {
                   {t("terminal.probeClose")}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {terminalSyncResultModal.open ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeTerminalSyncResultModal();
+          }}
+        >
+          <div
+            className="modal-panel modal-panel-terminal-sync-result"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="terminal-sync-result-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <h3 id="terminal-sync-result-title">
+                {terminalSyncResultModal.isError
+                  ? t("employees.terminalSyncErrorTitle")
+                  : t("employees.terminalSyncResultTitle")}
+              </h3>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={closeTerminalSyncResultModal}
+                aria-label={t("common.close")}
+              >
+                <X size={15} strokeWidth={1.75} />
+              </button>
+            </div>
+            <div className="scroll-modern terminal-sync-result-body">
+              <p className={terminalSyncResultModal.isError ? "login-err" : "terminal-sync-result-msg"}>
+                {terminalSyncResultModal.message}
+              </p>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="modal-btn modal-btn-primary" onClick={closeTerminalSyncResultModal}>
+                {t("common.close")}
+              </button>
             </div>
           </div>
         </div>

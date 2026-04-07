@@ -258,6 +258,43 @@ async function requireActiveAdminOrSuperadmin(req, res) {
   return true;
 }
 
+async function runSyncEmployeesAcrossTerminals(terminalRows) {
+  let created = 0;
+  let updated = 0;
+  let totalUsers = 0;
+  let scannedTotal = 0;
+  let pagesTotal = 0;
+  let enrichedTotal = 0;
+  const details = [];
+  for (const t of terminalRows) {
+    const r = await syncEmployeesFromTerminal(pool, t);
+    details.push({
+      terminalId: t.id,
+      terminalName: t.terminal_name ?? null,
+      ...r,
+    });
+    if (r.ok) {
+      created += r.created;
+      updated += r.updated;
+      totalUsers += r.total;
+      scannedTotal += Number(r.scanned) || 0;
+      pagesTotal += Number(r.pages) || 0;
+      enrichedTotal += Number(r.enriched) || 0;
+    }
+  }
+  return {
+    ok: true,
+    terminalCount: terminalRows.length,
+    created,
+    updated,
+    totalDeviceUsers: totalUsers,
+    scannedTotal,
+    pagesTotal,
+    enrichedTotal,
+    details,
+  };
+}
+
 const DB_TABLE_CONFIG = {
   employees: {
     pk: { name: "id", type: "int" },
@@ -938,40 +975,34 @@ api.post("/terminals/sync-all-my-employees", async (req, res) => {
       `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE admin_id = $1 ORDER BY id`,
       [adminId]
     );
-    let created = 0;
-    let updated = 0;
-    let totalUsers = 0;
-    let scannedTotal = 0;
-    let pagesTotal = 0;
-    let enrichedTotal = 0;
-    const details = [];
-    for (const t of rows) {
-      const r = await syncEmployeesFromTerminal(pool, t);
-      details.push({
-        terminalId: t.id,
-        terminalName: t.terminal_name ?? null,
-        ...r,
-      });
-      if (r.ok) {
-        created += r.created;
-        updated += r.updated;
-        totalUsers += r.total;
-        scannedTotal += Number(r.scanned) || 0;
-        pagesTotal += Number(r.pages) || 0;
-        enrichedTotal += Number(r.enriched) || 0;
-      }
+    const result = await runSyncEmployeesAcrossTerminals(rows);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+/** Admin: o‘z terminallari; superadmin: barcha terminallar (Hikvision ISAPI orqali import). */
+api.post("/employees/generate-from-terminals", async (req, res) => {
+  try {
+    const ok = await requireActiveAdminOrSuperadmin(req, res);
+    if (!ok) return;
+    let rows;
+    if (req.auth?.role === "superadmin") {
+      const r = await pool.query(
+        `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password FROM terminals ORDER BY id`
+      );
+      rows = r.rows;
+    } else {
+      const r = await pool.query(
+        `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE admin_id = $1 ORDER BY id`,
+        [req.auth.sub]
+      );
+      rows = r.rows;
     }
-    res.json({
-      ok: true,
-      terminalCount: rows.length,
-      created,
-      updated,
-      totalDeviceUsers: totalUsers,
-      scannedTotal,
-      pagesTotal,
-      enrichedTotal,
-      details,
-    });
+    const result = await runSyncEmployeesAcrossTerminals(rows);
+    res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });

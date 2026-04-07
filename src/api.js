@@ -148,6 +148,8 @@ export const api = {
   syncTerminalEmployees: (id) =>
     request(`/terminals/${encodeURIComponent(String(id))}/sync-employees`, { method: "POST", body: "{}" }),
   syncAllTerminalsEmployees: () => request("/terminals/sync-all-my-employees", { method: "POST", body: "{}" }),
+  generateEmployeesFromTerminals: () =>
+    request("/employees/generate-from-terminals", { method: "POST", body: "{}" }),
   setUserSubscription: (id, endAt, amount, text) =>
     request(`/users/${id}/subscription`, { method: "PATCH", body: JSON.stringify({ endAt, amount, text }) }),
   cancelUserSubscription: (id) => request(`/users/${id}/subscription`, { method: "DELETE" }),
@@ -189,6 +191,4 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ pks }),
     }),
-  downloadAttendanceFaceImages: () =>
-    request("/attendance/download-images", { method: "POST", body: JSON.stringify({}) }),
 };

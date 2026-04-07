@@ -7,11 +7,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
 const pool = new pg.Pool({
-  user: process.env.DATABASE_USER || "postgres",
+  user: process.env.DATABASE_USER || "restouser",
   password: process.env.DATABASE_PASSWORD,
   host: process.env.DATABASE_HOST || "localhost",
   port: Number(process.env.DATABASE_PORT) || 5432,
-  database: process.env.DATABASE_NAME || "keldi",
+  database: process.env.DATABASE_NAME || "restocontrol_db",
 });
 
 export async function initSchema() {

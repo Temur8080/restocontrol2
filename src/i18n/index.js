@@ -9,6 +9,16 @@ export function localeToBcp47(locale) {
   return BCP47[locale] || BCP47.uz;
 }
 
+/** Jumla boshidagi birinchi belgini til qoidalariga mos katta harf qiladi (masalan: aprel → Aprel). */
+export function capitalizeLocaleFirst(str, locale) {
+  const s = String(str ?? "").trim();
+  if (!s) return s;
+  const loc = localeToBcp47(locale);
+  const first = s[0];
+  if (!first) return s;
+  return first.toLocaleUpperCase(loc) + s.slice(1);
+}
+
 function getNested(obj, path) {
   return path.split(".").reduce((o, k) => (o != null && typeof o === "object" ? o[k] : undefined), obj);
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { summarizeRemaining } from "./salaryEngine.js";
+import { summarizeRemaining } from "../src/salaryEngine.js";
 
 describe("salary engine", () => {
   it("keeps 3 days after paying 7 of 10", () => {
