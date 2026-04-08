@@ -198,9 +198,19 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     if (byName.rows.length > 0) {
       const row = byName.rows[0];
       const prevName = normalizeEmployeeEventName(row.name);
-      const hadCard = String(row.access_card_no || "").trim() !== "";
-      if (prevName !== nm || hadCard) {
-        await pool.query(`UPDATE employees SET name = $1, access_card_no = NULL WHERE id = $2`, [nm, row.id]);
+      const prevCard = String(row.access_card_no || "").trim();
+      const allowName = isPlaceholderOrAutoHodimName(prevName, terminalKey);
+      const newName = allowName ? nm : String(row.name ?? "").trim() || prevName;
+      const nameChanged = allowName && normalizeEmployeeEventName(nm) !== prevName;
+      let newCard = prevCard;
+      if (terminalKey && !prevCard) newCard = terminalKey;
+      const cardChanged = newCard !== prevCard;
+      if (nameChanged || cardChanged) {
+        await pool.query(`UPDATE employees SET name = $1, access_card_no = $2 WHERE id = $3`, [
+          newName,
+          newCard || null,
+          row.id,
+        ]);
         updated += 1;
       }
       continue;
