@@ -12,7 +12,7 @@ import {
 } from "./terminalHikvision.js";
 import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.js";
 import { resolveSnapshotForTerminalEvent } from "./attendanceFaceImages.js";
-import { employeeMatchByAccessCardSql } from "./employeeAccessCards.js";
+import { employeeMatchByNormalizedNameSql, employeeMatchByAccessCardSql } from "./employeeAccessCards.js";
 import { isCheckoutTerminalType, isExitLikeAccessEvent } from "./hikvisionAccessDirection.js";
 import { isPrivateLanHostname } from "./terminalProbe.js";
 
@@ -188,21 +188,24 @@ async function getTerminalEventTimezoneOffsetHours(pool) {
 }
 
 /**
- * Terminal hodisasi: hodimni faqat hodisa kaliti bilan bog‘laymiz (employeeNoString / employeeNo / cardNo ↔ access_card_no).
- * Bazada ism bo‘yicha qidiruv yo‘q. Ism hodisadan kelsa, hodim yozuviga yoziladi/yangilanadi.
+ * Hodim-nazorati kabi: birinchi kirish/chiqishda hodisadan kelgan ism (va karta raqami) Hodimlar ro‘yxatiga
+ * yoziladi yoki yangilanadi, keyin davomat shu yozuvga bog‘lanadi.
+ * Qidiruv: avvalo access_card_no, keyin normalizatsiyalangan ism; yo‘q bo‘lsa INSERT.
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
 export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const nameFromEvent = normalizeEmployeeEventName(eventEmployeeName(ev));
   const empKey = eventEmployeeKey(ev);
   const timeIso = eventTimeIso(ev);
-  if (!empKey || !timeIso) {
-    const bits = [];
-    if (!empKey) bits.push("hodisa_kaliti_yoq");
-    if (!timeIso) bits.push("vaqt_yoq");
+
+  if (!timeIso) {
+    return { ok: false, reason: "vaqt_yoq (hodisada time/dateTime kerak)" };
+  }
+  if (!empKey && !nameFromEvent) {
     return {
       ok: false,
-      reason: `${bits.join("+")} (hodisada employeeNoString/employeeNo/cardNo va vaqt bo‘lishi kerak)`,
+      reason:
+        "hodim_aniqlanmadi (hodisada ism yoki employeeNoString/employeeNo/cardNo kerak — birinchi hodisa bilan Hodimlar ro‘yxatiga tushadi)",
     };
   }
 
@@ -219,25 +222,51 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     return { ok: false, reason: "terminal_admin_yoq" };
   }
 
-  let empR = await pool.query(
-    `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
-     FROM employees e
-     WHERE ${employeeMatchByAccessCardSql}
-     LIMIT 1`,
-    [adminId, empKey]
-  );
+  let empR = { rows: [] };
+
+  if (empKey) {
+    empR = await pool.query(
+      `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
+       FROM employees e
+       WHERE ${employeeMatchByAccessCardSql}
+       LIMIT 1`,
+      [adminId, empKey]
+    );
+  }
+
+  if (empR.rows.length === 0 && nameFromEvent) {
+    empR = await pool.query(
+      `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
+       FROM employees e
+       WHERE ${employeeMatchByNormalizedNameSql}
+       LIMIT 1`,
+      [adminId, nameFromEvent]
+    );
+  }
 
   if (empR.rows.length === 0) {
     const defaultFilial = await getDefaultFilialForAdmin(pool, adminId);
     const newName = nameFromEvent || `Hodim ${String(empKey).trim()}`;
+    const cardVal = empKey ? String(empKey).trim() : null;
     empR = await pool.query(
       `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end, access_card_no)
        VALUES ($1, $2, 'Hodim', $3, '09:00', '18:00', $4)
        RETURNING id, admin_id, shift_start, shift_end, weekly_schedule`,
-      [adminId, newName, defaultFilial, String(empKey).trim()]
+      [adminId, newName, defaultFilial, cardVal]
     );
-  } else if (nameFromEvent) {
-    await pool.query(`UPDATE employees SET name = $1 WHERE id = $2`, [nameFromEvent, empR.rows[0].id]);
+  } else {
+    const row = empR.rows[0];
+    if (nameFromEvent) {
+      await pool.query(`UPDATE employees SET name = $1 WHERE id = $2`, [nameFromEvent, row.id]);
+    }
+    if (empKey) {
+      await pool.query(
+        `UPDATE employees SET access_card_no = $2
+         WHERE id = $1
+           AND (access_card_no IS NULL OR BTRIM(COALESCE(access_card_no::text, '')) = '')`,
+        [row.id, String(empKey).trim()]
+      );
+    }
   }
 
   const emp = empR.rows[0];

@@ -290,6 +290,131 @@ function looksLikeBinaryImageBody(body) {
   return body.length > 500 && body[0] === 0xff && body[1] === 0xd8;
 }
 
+/** Multipart qism: fayl/rasm (matn emas) — hodim-nazorati «Files: N» uchun. */
+function looksLikeBinaryAttachmentBody(body, headersLatin1) {
+  if (!body || body.length === 0) return false;
+  const h = String(headersLatin1 || "");
+  if (/filename\s*=/i.test(h)) return true;
+  if (looksLikeBinaryImageBody(body)) return true;
+  const ctPart = h.match(/Content-Type:\s*([^\r\n]+)/i);
+  const ctv = ctPart ? String(ctPart[1]).toLowerCase() : "";
+  if ((ctv.includes("image/") || ctv.includes("application/octet-stream")) && body.length > 80) return true;
+  if (body.length > 400 && body.includes(0)) return true;
+  return false;
+}
+
+/**
+ * Debug: multipart `name=` lar, fayl soni, matn qismlardan yig‘ilgan obyekt (boshqa loyihadagi Body sample ga o‘xshash).
+ * @returns {{ keys: string[], fileCount: number, pseudoBody: Record<string, string> } | null}
+ */
+function multipartDebugInspect(buffer, contentType) {
+  const ct = String(contentType || "");
+  const bm = ct.match(/boundary\s*=\s*"?([^";\s]+)"?/i);
+  if (!bm || !Buffer.isBuffer(buffer)) return null;
+  const boundaryStr = bm[1].trim().replace(/^["']|["']$/g, "");
+  const delimiter = Buffer.from(`--${boundaryStr}`);
+  const keys = [];
+  let fileCount = 0;
+  /** @type {Record<string, string>} */
+  const pseudoBody = {};
+  let offset = 0;
+  for (;;) {
+    const idx = buffer.indexOf(delimiter, offset);
+    if (idx < 0) break;
+    let partBegin = idx + delimiter.length;
+    if (partBegin + 1 < buffer.length && buffer[partBegin] === 0x2d && buffer[partBegin + 1] === 0x2d) {
+      break;
+    }
+    if (partBegin + 1 < buffer.length && buffer[partBegin] === 0x0d && buffer[partBegin + 1] === 0x0a) {
+      partBegin += 2;
+    } else if (partBegin < buffer.length && buffer[partBegin] === 0x0a) {
+      partBegin += 1;
+    }
+    const nextBoundary = buffer.indexOf(delimiter, partBegin);
+    const partEnd = nextBoundary < 0 ? buffer.length : nextBoundary;
+    const part = buffer.subarray(partBegin, partEnd);
+    const split = mimePartHeaderBodySplit(part);
+    if (!split) {
+      offset = idx + delimiter.length;
+      continue;
+    }
+    const headers = part.subarray(0, split.headerLen).toString("latin1");
+    const nameMatch = headers.match(/name\s*=\s*"([^"]+)"/i) || headers.match(/name\s*=\s*([^;\r\n]+)/i);
+    const fn = nameMatch ? String(nameMatch[1] || nameMatch[2]).trim().replace(/^"|"$/g, "") : "";
+    let body = part.subarray(split.bodyStart);
+    while (
+      body.length >= 2 &&
+      body[body.length - 2] === 0x0d &&
+      body[body.length - 1] === 0x0a
+    ) {
+      body = body.subarray(0, body.length - 2);
+    }
+    while (body.length >= 1 && body[body.length - 1] === 0x0a) {
+      body = body.subarray(0, body.length - 1);
+    }
+    const isFile = looksLikeBinaryAttachmentBody(body, headers);
+    if (isFile) fileCount += 1;
+    else if (fn && body.length > 0) {
+      try {
+        pseudoBody[fn] = body.toString("utf8");
+      } catch {
+        pseudoBody[fn] = "[binary]";
+      }
+    }
+    if (fn) keys.push(fn);
+    offset = idx + delimiter.length;
+  }
+  return { keys, fileCount, pseudoBody };
+}
+
+/**
+ * Hodim-nazorati uslubidagi batafsil log (.env: HIKVISION_HTTP_DEBUG=1).
+ */
+function logHikvisionVerboseIncoming(req, buf, ct, clientIp) {
+  const line = (s) => console.log(`[hikvision http] ${s}`);
+  line("==========================================");
+  line("HIKVISION EVENT KELDI");
+  line("==========================================");
+  const headers = {
+    host: req.get("host") || "",
+    "x-real-ip": req.get("x-real-ip") || "",
+    "x-forwarded-for": req.get("x-forwarded-for") || "",
+    "x-forwarded-proto": req.get("x-forwarded-proto") || "",
+    connection: req.get("connection") || "",
+    "content-length": req.get("content-length") || "",
+    accept: req.get("accept") || "",
+    "content-type": ct,
+  };
+  line(`Headers: ${JSON.stringify(headers, null, 2)}`);
+  line(`Method: ${req.method || ""}`);
+  line(`URL: ${req.originalUrl || req.url || ""}`);
+  line(`Content-Type: ${ct || ""}`);
+
+  if (/multipart\/form-data/i.test(ct)) {
+    const ins = multipartDebugInspect(buf, ct);
+    if (ins) {
+      line("Body type: object");
+      line(`Body keys: ${JSON.stringify(ins.keys)}`);
+      line(`Files: ${ins.fileCount}`);
+      const sample = JSON.stringify(ins.pseudoBody);
+      const max = 4000;
+      line(`Body sample: ${sample.length > max ? `${sample.slice(0, max)}…` : sample}`);
+    } else {
+      line("Body type: buffer (multipart boundary topilmadi)");
+      const t = buf.toString("utf8", 0, Math.min(buf.length, 1200)).replace(/\s+/g, " ").trim();
+      line(`Body sample: ${t}`);
+    }
+  } else {
+    line("Body type: buffer");
+    const t =
+      buf.length === 0
+        ? "(bo‘sh)"
+        : buf.toString("utf8", 0, Math.min(buf.length, 2500)).replace(/\s+/g, " ").trim();
+    line(`Body sample: ${t}`);
+  }
+  line("==========================================");
+}
+
 /**
  * Bitta matndan JSON yoki XML Hikvision hodisasini ajratib `out` ga qo‘shadi.
  * @returns {boolean} — biror hodisa qo‘shildi yoki deviceIp topildi
@@ -650,28 +775,13 @@ export async function handleHikvisionHttpEvent(req, pool) {
   const debugHttp = String(process.env.HIKVISION_HTTP_DEBUG || "").trim() === "1";
 
   if (debugHttp) {
-    const hdr = {
-      host: req.get("host") || "",
-      "x-real-ip": req.get("x-real-ip") || "",
-      "x-forwarded-for": req.get("x-forwarded-for") || "",
-      "x-forwarded-proto": req.get("x-forwarded-proto") || "",
-      "content-type": ct,
-      "content-length": req.get("content-length") || "",
-    };
-    console.log(
-      `[hikvision http][debug] ${req.method} ${req.originalUrl || ""} headers=${JSON.stringify(hdr)}`
-    );
-    const peek = Math.min(buf.length, 1500);
-    const sample = buf
-      .subarray(0, peek)
-      .toString("utf8")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 800);
-    console.log(`[hikvision http][debug] tana=${buf.length}b, namuna: ${sample}${peek < buf.length ? "…" : ""}`);
+    logHikvisionVerboseIncoming(req, buf, ct, clientIp);
   }
 
   if (bufferLooksLikeHeartbeat(buf)) {
+    if (debugHttp) {
+      console.log(`[hikvision http] HeartBeat event o'tkazib yuborildi (${ct || "multipart/form-data"})`);
+    }
     console.log(`[hikvision http] heartBeat → 200 OK (ip="${clientIp}", tana=${buf.length}b)`);
     return { status: 200, body: "OK" };
   }
@@ -709,7 +819,7 @@ export async function handleHikvisionHttpEvent(req, pool) {
       major: e0?.major,
       minor: e0?.minor,
     };
-    console.log(`[hikvision http][debug] 1-hodisa maydonlari: ${JSON.stringify(snap)}`);
+    console.log(`[hikvision http] Tahlildan keyin 1-hodisa: ${JSON.stringify(snap)}`);
   }
 
   if (nEv === 0) {
