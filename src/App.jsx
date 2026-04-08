@@ -3885,6 +3885,9 @@ function App() {
       if (d?.attendanceRecords) {
         setAttendanceRecords(Array.isArray(d.attendanceRecords) ? d.attendanceRecords : []);
       }
+      // DB'dan qayta yuklaganda ro'yxat yashirinib qolmasligi uchun filtrlarni tiklaymiz.
+      setFilialFilter("all");
+      setCardFilter("all");
       const dbLoadMessage =
         locale === "ru"
           ? `Список сотрудников обновлен из базы данных. Загружено: ${employeesFromDb.length}.`
