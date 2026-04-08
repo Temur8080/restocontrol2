@@ -50,7 +50,6 @@ const DEFAULT_ACTIVE_MENU = "Dashboard";
 const ADMIN_ROLE_MENUS = ["Dashboard", "Hodimlar", "Hisobot", "Sozlamalar", "Bildirishnoma"];
 const SUPERADMIN_ROLE_MENUS = ["Adminlar", "Terminallar", "Baza", "Sozlamalar", "Bildirishnoma"];
 const ACTIVE_MENU_STORAGE_KEY = "active-menu";
-const DENSITY_STORAGE_KEY = "ui-density";
 const ALL_FILIALS_VALUE = "__all_filials__";
 const SUBSCRIPTION_NOTICE_HISTORY_STORAGE_KEY = "subscription-notice-history-v1";
 const SUPERADMIN_CONTACT_URL = "https://t.me/temur_8080";
@@ -136,6 +135,47 @@ function isValidIpAddress(value) {
   const ipv4 =
     /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
   return ipv4.test(v);
+}
+
+/** Baza jadval tanlovida ko‘rinadigan sarlavha; tarjima yo‘q bo‘lsa SQL nomi. */
+function bazaTableDisplayName(tableName, t) {
+  const key = `baza.tableName.${tableName}`;
+  const label = t(key);
+  return label === key ? String(tableName || "") : label;
+}
+
+/** Baza jadvalidagi ustun: avval `baza.column.<jadval>.<ustun>`, keyin `baza.column._common.<ustun>`, aks holda SQL nomi. */
+function bazaColumnDisplayName(tableName, columnName, t) {
+  const col = String(columnName || "");
+  if (!col) return "";
+  const tbl = String(tableName || "");
+  if (tbl) {
+    const spec = `baza.column.${tbl}.${col}`;
+    const specLabel = t(spec);
+    if (specLabel !== spec) return specLabel;
+  }
+  const common = `baza.column._common.${col}`;
+  const commonLabel = t(common);
+  if (commonLabel !== common) return commonLabel;
+  return col;
+}
+
+/** Baza explorer PATCH/DELETE uchun qator kaliti: kompozit PK — JSON; aks holda skalyar. */
+function buildDbExplorerRowPkKey(row, cfg) {
+  if (!row || !cfg || cfg.readOnly) return "";
+  const cols = cfg.pkColumns;
+  if (cfg.compositePk && Array.isArray(cols) && cols.length > 0) {
+    const o = {};
+    for (const { name } of cols) {
+      const v = row[name];
+      if (v === undefined || v === null) return "";
+      o[name] = v instanceof Date ? v.toISOString() : v;
+    }
+    return JSON.stringify(o);
+  }
+  const n = cfg.pk?.name;
+  if (!n || row[n] == null) return "";
+  return String(row[n]);
 }
 
 function removeUserFilial(setForm, f) {
@@ -1071,14 +1111,6 @@ function App() {
     }
   });
   const [theme, setTheme] = useState("light");
-  const [uiDensity, setUiDensity] = useState(() => {
-    try {
-      const v = localStorage.getItem(DENSITY_STORAGE_KEY);
-      return v === "dense" ? "dense" : "normal";
-    } catch {
-      return "normal";
-    }
-  });
   const [salaryCalcWeekMode, setSalaryCalcWeekMode] = useState("workdays");
   const [salaryCalcWeekFixed, setSalaryCalcWeekFixed] = useState(5);
   const [salaryCalcMonthMode, setSalaryCalcMonthMode] = useState("workdays");
@@ -1152,12 +1184,15 @@ function App() {
   const [terminalsBusy, setTerminalsBusy] = useState(false);
   const [terminalsError, setTerminalsError] = useState(null);
   const [terminalModalOpen, setTerminalModalOpen] = useState(false);
+  const [terminalEditingId, setTerminalEditingId] = useState(null);
+  const [terminalFilialOptions, setTerminalFilialOptions] = useState([]);
   const [terminalSaveBusy, setTerminalSaveBusy] = useState(false);
   const [terminalSaveError, setTerminalSaveError] = useState("");
   const [terminalForm, setTerminalForm] = useState({
     terminalName: "",
     adminId: "",
     terminalType: "Kirish",
+    filial: "",
     ipAddress: "",
     login: "",
     password: "",
@@ -1169,6 +1204,9 @@ function App() {
   const [terminalProbeResult, setTerminalProbeResult] = useState(null);
   const [terminalSyncBusy, setTerminalSyncBusy] = useState(false);
   const [terminalTableSyncBusyId, setTerminalTableSyncBusyId] = useState(null);
+  const [terminalDeleteBusyId, setTerminalDeleteBusyId] = useState(null);
+  /** Superadmin: Terminallar jadvalida admin bo'yicha ko'rish filtri */
+  const [terminalAdminFilterId, setTerminalAdminFilterId] = useState("");
   const [terminalSyncResultModal, setTerminalSyncResultModal] = useState({
     open: false,
     message: "",
@@ -1403,12 +1441,6 @@ function App() {
     root.classList.toggle("theme-dark", theme === "dark");
     return () => root.classList.remove("theme-dark");
   }, [theme]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(DENSITY_STORAGE_KEY, uiDensity);
-    } catch {}
-  }, [uiDensity]);
 
   useEffect(() => {
     try {
@@ -1738,6 +1770,37 @@ function App() {
   }, [activeMenu, userRole, locale]);
 
   useEffect(() => {
+    if (!terminalModalOpen) return;
+    const aid = terminalForm.adminId;
+    if (!aid) {
+      setTerminalFilialOptions([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const d = await api.getUserFilials(Number(aid));
+        const list = Array.isArray(d?.filials) ? d.filials.map((x) => String(x).trim()).filter(Boolean) : [];
+        const opts = list.length > 0 ? list : ["Asosiy filial"];
+        if (cancelled) return;
+        setTerminalFilialOptions(opts);
+        setTerminalForm((f) => {
+          if (f.filial && opts.includes(f.filial)) return f;
+          return { ...f, filial: opts[0] || "Asosiy filial" };
+        });
+      } catch {
+        if (!cancelled) {
+          setTerminalFilialOptions(["Asosiy filial"]);
+          setTerminalForm((f) => ({ ...f, filial: "Asosiy filial" }));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [terminalModalOpen, terminalForm.adminId]);
+
+  useEffect(() => {
     if (activeMenu !== "Baza") return;
     if (userRole !== "superadmin") return;
     if (!authToken) return;
@@ -1799,6 +1862,17 @@ function App() {
     if (activeMenu !== "Baza") return;
     setDbSelectedPks([]);
   }, [activeMenu, dbTable, dbAdminFilterId, dbEmployeeFilterId]);
+
+  useEffect(() => {
+    if (activeMenu !== "Baza") return;
+    const aid = String(dbAdminFilterId || "").trim();
+    const eid = String(dbEmployeeFilterId || "").trim();
+    if (!eid || !aid) return;
+    const stillThere = employees.some(
+      (e) => String(e.id) === eid && String(e.adminId ?? "") === aid
+    );
+    if (!stillThere) setDbEmployeeFilterId("");
+  }, [activeMenu, dbAdminFilterId, dbEmployeeFilterId, employees]);
 
   async function submitLogin(e) {
     e.preventDefault();
@@ -3421,13 +3495,13 @@ function App() {
   }
 
   function openDbEditModal(row) {
-    if (!dbTableCfg) return;
-    const pkName = dbTableCfg.pk.name;
-    const pkVal = row[pkName];
+    if (!dbTableCfg || dbTableCfg.readOnly) return;
+    const pkKey = buildDbExplorerRowPkKey(row, dbTableCfg);
+    if (!pkKey) return;
     setDbEditError(null);
     setDbEditBusy(false);
     setDbEditTable(dbTable);
-    setDbEditPkVal(String(pkVal ?? ""));
+    setDbEditPkVal(pkKey);
     const draft = {};
     const editableCols = Array.isArray(dbTableCfg.columns) ? dbTableCfg.columns.filter((c) => c.editable) : [];
     for (const c of editableCols) {
@@ -3483,7 +3557,7 @@ function App() {
       setDbBusy(true);
       setDbError(null);
       await api.deleteDbRow(table, pkVal);
-      setDbSelectedPks((prev) => prev.filter((x) => String(x) !== String(pkVal)));
+      setDbSelectedPks((prev) => prev.filter((x) => x !== String(pkVal)));
       await refreshDbTable();
     } catch (err) {
       setDbError(translateApiError(err instanceof Error ? err.message : String(err), locale));
@@ -3789,15 +3863,47 @@ function App() {
     [users]
   );
 
+  const filteredTerminals = useMemo(() => {
+    const aid = String(terminalAdminFilterId || "").trim();
+    if (!aid) return terminals;
+    return terminals.filter((row) => String(row.admin_id ?? "") === aid);
+  }, [terminals, terminalAdminFilterId]);
+
+  const bazaEmployeesForFilter = useMemo(() => {
+    if (!Array.isArray(employees)) return [];
+    const aid = String(dbAdminFilterId || "").trim();
+    if (!aid) return employees;
+    return employees.filter((e) => String(e.adminId ?? "") === aid);
+  }, [employees, dbAdminFilterId]);
+
   function openCreateTerminalModal() {
     setTerminalSaveError("");
+    setTerminalEditingId(null);
     setTerminalForm({
       terminalName: "",
       adminId: terminalAdminOptions[0]?.id != null ? String(terminalAdminOptions[0].id) : "",
       terminalType: "Kirish",
+      filial: "",
       ipAddress: "",
       login: "",
       password: "",
+    });
+    setTerminalModalOpen(true);
+  }
+
+  function openEditTerminalModal(row) {
+    if (!row?.id) return;
+    setTerminalSaveError("");
+    setTerminalEditingId(Number(row.id));
+    setTerminalForm({
+      terminalName: String(row.terminal_name || "").trim(),
+      adminId: String(row.admin_id ?? ""),
+      terminalType: row.terminal_type === "Chiqish" ? "Chiqish" : "Kirish",
+      filial:
+        row.filial != null && String(row.filial).trim() !== "" ? String(row.filial).trim() : "",
+      ipAddress: String(row.ip_address || "").trim(),
+      login: String(row.login || "").trim(),
+      password: String(row.password || "").trim(),
     });
     setTerminalModalOpen(true);
   }
@@ -3807,10 +3913,11 @@ function App() {
     const terminalName = String(terminalForm.terminalName || "").trim();
     const adminId = String(terminalForm.adminId || "").trim();
     const terminalType = terminalForm.terminalType === "Chiqish" ? "Chiqish" : "Kirish";
+    const filial = String(terminalForm.filial || "").trim();
     const ipAddress = String(terminalForm.ipAddress || "").trim();
     const login = String(terminalForm.login || "").trim();
     const password = String(terminalForm.password || "").trim();
-    if (!terminalName || !adminId || !ipAddress || !login || !password) {
+    if (!terminalName || !adminId || !filial || !ipAddress || !login || !password) {
       setTerminalSaveError(t("terminal.validationRequired"));
       return;
     }
@@ -3821,21 +3928,45 @@ function App() {
     try {
       setTerminalSaveBusy(true);
       setTerminalSaveError("");
-      await api.createTerminal({
+      const body = {
         terminalName,
         adminId,
         terminalType,
+        filial,
         ipAddress,
         login,
         password,
-      });
+      };
+      if (terminalEditingId != null) {
+        await api.updateTerminal(terminalEditingId, body);
+      } else {
+        await api.createTerminal(body);
+      }
       const d = await api.getTerminals();
       setTerminals(Array.isArray(d?.terminals) ? d.terminals : []);
       setTerminalModalOpen(false);
+      setTerminalEditingId(null);
     } catch (err) {
       setTerminalSaveError(translateApiError(err instanceof Error ? err.message : String(err), locale));
     } finally {
       setTerminalSaveBusy(false);
+    }
+  }
+
+  async function handleDeleteTerminal(row) {
+    if (!row?.id || userRole !== "superadmin") return;
+    const ok = window.confirm(t("confirm.deleteTerminal"));
+    if (!ok) return;
+    try {
+      setTerminalDeleteBusyId(row.id);
+      setTerminalsError(null);
+      await api.deleteTerminal(row.id);
+      const d = await api.getTerminals();
+      setTerminals(Array.isArray(d?.terminals) ? d.terminals : []);
+    } catch (err) {
+      setTerminalsError(translateApiError(err instanceof Error ? err.message : String(err), locale));
+    } finally {
+      setTerminalDeleteBusyId(null);
     }
   }
 
@@ -3944,7 +4075,7 @@ function App() {
 
   if (!authToken) {
     return (
-      <div className="page theme-light login-page" style={{ "--login-bg-image": `url(${loginBgImage})` }}>
+      <div className="page theme-light ui-dense login-page" style={{ "--login-bg-image": `url(${loginBgImage})` }}>
         <div className="login-card">
           <div className="login-logo-wrap">
             <img src={logoImage} alt="Logo" className="login-logo-image" />
@@ -3983,7 +4114,7 @@ function App() {
 
   if (loadError) {
     return (
-      <div className={`page theme-light app-bootstrap`}>
+      <div className={`page theme-light ui-dense app-bootstrap`}>
         <div className="app-bootstrap-inner">
           <p className="app-bootstrap-title">{t("bootstrap.dbErrorTitle")}</p>
           <p className="app-bootstrap-msg">{loadError}</p>
@@ -3998,7 +4129,7 @@ function App() {
 
   if (!dataReady) {
     return (
-      <div className={`page theme-${theme} app-bootstrap`}>
+      <div className={`page theme-${theme} ui-dense app-bootstrap`}>
         <div className="app-bootstrap-inner">
           <p className="app-bootstrap-title">{t("bootstrap.loading")}</p>
         </div>
@@ -4027,15 +4158,24 @@ function App() {
         : activeMenu;
 
   const dbTableCfg = Array.isArray(dbMeta?.tables) ? dbMeta.tables.find((t) => t.name === dbTable) : null;
-  const dbPkName = dbTableCfg?.pk?.name || "";
-  const dbAllPkVals = dbPkName && Array.isArray(dbRows) ? dbRows.map((r) => r?.[dbPkName]).filter((x) => x != null).map((x) => String(x)) : [];
+  const dbBazaMutable = Boolean(
+    dbTableCfg &&
+      !dbTableCfg.readOnly &&
+      Array.isArray(dbTableCfg.pkColumns) &&
+      dbTableCfg.pkColumns.length > 0
+  );
+  const dbAllPkVals =
+    dbBazaMutable && Array.isArray(dbRows)
+      ? dbRows.map((r) => buildDbExplorerRowPkKey(r, dbTableCfg)).filter((k) => k !== "")
+      : [];
   const dbAllSelected = dbAllPkVals.length > 0 && dbAllPkVals.every((x) => dbSelectedPks.includes(x));
+  const dbBazaColSpan = dbColumns.length + (dbBazaMutable ? 2 : 0);
 
   return (
-    <div className={`page theme-${theme} ui-${uiDensity}`}>
+    <div className={`page theme-${theme} ui-dense`}>
       <header className="mobile-app-header">
         <div className="mobile-app-header-brand">
-          <img src={brandLogo} alt="" className="mobile-app-header-logo" width={36} height={36} />
+          <img src={brandLogo} alt="" className="mobile-app-header-logo" width={32} height={32} />
           <div className="mobile-app-header-text">
             <span className="mobile-app-header-kicker">RestoControl</span>
             <span className="mobile-app-header-title">{mobileScreenTitle}</span>
@@ -4049,7 +4189,7 @@ function App() {
             title={t("menu.notice")}
             onClick={() => setActiveMenu("Bildirishnoma")}
           >
-            <Bell size={18} strokeWidth={2} />
+            <Bell size={16} strokeWidth={1.75} />
             {unreadSubscriptionNoticeCount > 0 ? (
               <span className="mobile-header-notice-badge">
                 {unreadSubscriptionNoticeCount > 99 ? "99+" : unreadSubscriptionNoticeCount}
@@ -4063,7 +4203,7 @@ function App() {
             title={t("sidebar.logout")}
             onClick={logout}
           >
-            <LogOut size={18} strokeWidth={2} />
+            <LogOut size={16} strokeWidth={1.75} />
           </button>
         </div>
       </header>
@@ -4762,34 +4902,53 @@ function App() {
         ) : !showEmployeeAttendanceGrid ? (
           activeMenu === "Terminallar" ? (
             <section className="table-wrap journal-wrap scroll-modern">
-              <div className="journal-top-row">
+              <div className="journal-top-row terminal-journal-top-row">
                 <h3 className="journal-title">{t("terminal.pageTitle")}</h3>
-                <div className="terminal-page-toolbar-btns">
-                  {userRole === "admin" || userRole === "superadmin" ? (
+                <div className="terminal-journal-top-tools">
+                  {userRole === "superadmin" ? (
+                    <div className="terminal-admin-filter">
+                      <select
+                        id="terminal-list-admin-filter"
+                        className="terminal-admin-filter-select"
+                        aria-label={t("terminal.filterByAdminAria")}
+                        value={terminalAdminFilterId}
+                        onChange={(e) => setTerminalAdminFilterId(e.target.value)}
+                      >
+                        <option value="">{t("common.allRecords")}</option>
+                        {terminalAdminOptions.map((u) => (
+                          <option key={u.id} value={String(u.id)}>
+                            {u.username}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
+                  <div className="terminal-page-toolbar-btns">
+                    {userRole === "admin" || userRole === "superadmin" ? (
+                      <button
+                        type="button"
+                        className="terminal-toolbar-sync-btn"
+                        aria-label={t("terminal.syncAllEmployeesAria")}
+                        title={t("terminal.syncAllEmployeesTitle")}
+                        disabled={terminalSyncBusy || terminalTableSyncBusyId != null}
+                        onClick={() => pullEmployeesFromTerminals()}
+                      >
+                        {terminalSyncBusy ? (
+                          <Loader2 size={14} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
+                        ) : (
+                          <Download size={14} strokeWidth={2} aria-hidden />
+                        )}
+                      </button>
+                    ) : null}
                     <button
                       type="button"
-                      className="terminal-toolbar-sync-btn"
-                      aria-label={t("terminal.syncAllEmployeesAria")}
-                      title={t("terminal.syncAllEmployeesTitle")}
-                      disabled={terminalSyncBusy || terminalTableSyncBusyId != null}
-                      onClick={() => pullEmployeesFromTerminals()}
+                      className="module-right-btn"
+                      aria-label={t("terminal.addAria")}
+                      onClick={openCreateTerminalModal}
                     >
-                      {terminalSyncBusy ? (
-                        <Loader2 size={14} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
-                      ) : (
-                        <Download size={14} strokeWidth={2} aria-hidden />
-                      )}
-                      <span>{t("terminal.syncAllShort")}</span>
+                      <Plus size={14} strokeWidth={2} />
                     </button>
-                  ) : null}
-                  <button
-                    type="button"
-                    className="module-right-btn"
-                    aria-label={t("terminal.addAria")}
-                    onClick={openCreateTerminalModal}
-                  >
-                    <Plus size={14} strokeWidth={2} />
-                  </button>
+                  </div>
                 </div>
               </div>
 
@@ -4802,6 +4961,7 @@ function App() {
                     <tr>
                       <th>{t("terminal.name")}</th>
                       <th>{t("terminal.admin")}</th>
+                      <th>{t("terminal.filial")}</th>
                       <th>{t("terminal.type")}</th>
                       <th>{t("terminal.ipAddress")}</th>
                       <th>{t("terminal.login")}</th>
@@ -4810,58 +4970,84 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {terminals.map((row) => (
+                    {filteredTerminals.map((row) => (
                       <tr key={row.id}>
                         <td>{row.terminal_name || "—"}</td>
                         <td>{row.admin_username || "—"}</td>
+                        <td>{row.filial != null && String(row.filial).trim() !== "" ? String(row.filial) : "—"}</td>
                         <td>{row.terminal_type || "—"}</td>
                         <td>{row.ip_address || "—"}</td>
                         <td>{row.login || "—"}</td>
                         <td>{row.password || "—"}</td>
-                        <td>
-                          <div className="terminal-actions-cell">
-                            {userRole === "superadmin" ? (
-                              <button
-                                type="button"
-                                className="terminal-row-action-btn terminal-row-action-btn--probe"
-                                aria-label={t("terminal.testConnectionAria")}
-                                title={t("terminal.testConnection")}
-                                disabled={terminalProbeBusy}
-                                onClick={() => runTerminalConnectionTest(row)}
-                              >
-                                {terminalProbeBusy && terminalProbeTargetId === row.id ? (
-                                  <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
-                                ) : (
-                                  <Wifi size={15} strokeWidth={2} aria-hidden />
-                                )}
-                                <span>{t("terminal.actionProbeShort")}</span>
-                              </button>
-                            ) : null}
+                        <td className="actions">
+                          {userRole === "superadmin" ? (
                             <button
                               type="button"
-                              className="terminal-row-action-btn terminal-row-action-btn--sync"
-                              aria-label={t("terminal.syncEmployeesAria")}
-                              title={t("terminal.syncEmployees")}
-                              disabled={
-                                terminalProbeBusy || terminalSyncBusy || terminalTableSyncBusyId === row.id
-                              }
-                              onClick={() => syncTerminalEmployeesFromTable(row)}
+                              className="actions-icon actions-edit-btn"
+                              aria-label={t("common.edit")}
+                              title={t("common.edit")}
+                              onClick={() => openEditTerminalModal(row)}
                             >
-                              {terminalTableSyncBusyId === row.id ? (
-                                <Loader2 size={15} strokeWidth={2} className="terminal-btn-spinner" aria-hidden />
-                              ) : (
-                                <Download size={15} strokeWidth={2} aria-hidden />
-                              )}
-                              <span>{t("terminal.actionSyncShort")}</span>
+                              <Pencil size={14} strokeWidth={1.75} aria-hidden />
                             </button>
-                          </div>
+                          ) : null}
+                          {userRole === "superadmin" ? (
+                            <button
+                              type="button"
+                              className="actions-icon actions-delete-btn"
+                              aria-label={t("common.delete")}
+                              title={t("common.delete")}
+                              disabled={terminalDeleteBusyId != null}
+                              onClick={() => handleDeleteTerminal(row)}
+                            >
+                              <Trash2 size={14} strokeWidth={1.75} aria-hidden />
+                            </button>
+                          ) : null}
+                          {userRole === "superadmin" ? (
+                            <button
+                              type="button"
+                              className="actions-icon"
+                              aria-label={t("terminal.testConnectionAria")}
+                              title={t("terminal.testConnection")}
+                              disabled={terminalProbeBusy}
+                              onClick={() => runTerminalConnectionTest(row)}
+                            >
+                              {terminalProbeBusy && terminalProbeTargetId === row.id ? (
+                                <Loader2 size={14} strokeWidth={1.75} className="terminal-btn-spinner" aria-hidden />
+                              ) : (
+                                <Wifi size={14} strokeWidth={1.75} aria-hidden />
+                              )}
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="actions-icon"
+                            aria-label={t("terminal.syncEmployeesAria")}
+                            title={t("terminal.syncEmployees")}
+                            disabled={
+                              terminalProbeBusy || terminalSyncBusy || terminalTableSyncBusyId === row.id
+                            }
+                            onClick={() => syncTerminalEmployeesFromTable(row)}
+                          >
+                            {terminalTableSyncBusyId === row.id ? (
+                              <Loader2 size={14} strokeWidth={1.75} className="terminal-btn-spinner" aria-hidden />
+                            ) : (
+                              <Download size={14} strokeWidth={1.75} aria-hidden />
+                            )}
+                          </button>
                         </td>
                       </tr>
                     ))}
                     {terminals.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="empty-row">
+                        <td colSpan={8} className="empty-row">
                           {t("terminal.empty")}
+                        </td>
+                      </tr>
+                    ) : filteredTerminals.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="empty-row">
+                          {t("terminal.emptyForAdminFilter")}
                         </td>
                       </tr>
                     ) : null}
@@ -4871,15 +5057,14 @@ function App() {
             </section>
           ) : activeMenu === "Baza" ? (
             <section className="table-wrap journal-wrap baza-panel scroll-modern">
-              <div className="journal-top-row">
+              <div className="journal-top-row baza-journal-top-row">
                 <h3 className="journal-title">{t("baza.pageTitle")}</h3>
-              </div>
-
-              <div className="baza-filters" style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 10 }}>
-                <div className="modal-field" style={{ margin: 0 }}>
-                  <label htmlFor="db-admin">{t("baza.labelAdmin")}</label>
+                <div className="baza-journal-top-tools">
                   <select
                     id="db-admin"
+                    className="baza-filter-select baza-filter-select--admin"
+                    aria-label={t("baza.labelAdmin")}
+                    title={t("baza.labelAdmin")}
                     value={dbAdminFilterId}
                     onChange={(e) => setDbAdminFilterId(e.target.value)}
                   >
@@ -4892,88 +5077,87 @@ function App() {
                         </option>
                       ))}
                   </select>
-                </div>
-
-                <div className="modal-field" style={{ margin: 0 }}>
-                  <label htmlFor="db-table">{t("baza.labelTable")}</label>
                   <select
                     id="db-table"
+                    className="baza-filter-select baza-filter-select--table"
+                    aria-label={t("baza.labelTable")}
+                    title={t("baza.labelTable")}
                     value={dbTable}
                     onChange={(e) => setDbTable(e.target.value)}
                     disabled={!dbMeta}
                   >
                     {!dbMeta ? <option value="">{t("common.loading")}</option> : null}
                     {Array.isArray(dbMeta?.tables)
-                      ? dbMeta.tables.map((t) => (
-                          <option key={t.name} value={t.name}>
-                            {t.name}
+                      ? dbMeta.tables.map((tbl) => (
+                          <option key={tbl.name} value={tbl.name} title={tbl.name}>
+                            {bazaTableDisplayName(tbl.name, t)}
                           </option>
                         ))
                       : null}
                   </select>
-                </div>
-
-                <div className="modal-field" style={{ margin: 0 }}>
-                  <label htmlFor="db-employee">{t("baza.labelEmployee")}</label>
                   <select
                     id="db-employee"
+                    className="baza-filter-select baza-filter-select--employee"
+                    aria-label={t("baza.labelEmployee")}
+                    title={t("baza.labelEmployee")}
                     value={dbEmployeeFilterId}
                     onChange={(e) => setDbEmployeeFilterId(e.target.value)}
                   >
                     <option value="">{t("common.allRecords")}</option>
-                    {Array.isArray(employees)
-                      ? employees.map((e) => (
-                          <option key={e.id} value={String(e.id)}>
-                            {e.id} · {e.name}
-                          </option>
-                        ))
-                      : null}
+                    {bazaEmployeesForFilter.map((e) => (
+                      <option key={e.id} value={String(e.id)}>
+                        {e.id} · {e.name}
+                      </option>
+                    ))}
                   </select>
-                </div>
-
-                <div style={{ display: "flex", alignItems: "flex-end", marginLeft: "auto" }}>
                   <button
                     type="button"
-                    className="modal-btn modal-btn-ghost"
+                    className="baza-bulk-delete-btn"
                     onClick={() => deleteDbRowsBulk(dbTable, dbSelectedPks)}
-                    disabled={dbSelectedPks.length === 0 || dbBusy}
+                    disabled={!dbBazaMutable || dbSelectedPks.length === 0 || dbBusy}
                     title={t("admin.deleteSelectedAria")}
                     aria-label={t("admin.deleteSelectedAria")}
                   >
-                    <Trash2 size={16} strokeWidth={1.75} />
+                    <Trash2 size={14} strokeWidth={1.75} aria-hidden />
                   </button>
                 </div>
               </div>
 
-              {dbError ? <p className="login-err" style={{ marginTop: 10 }}>{dbError}</p> : null}
+              {dbError ? <p className="login-err baza-panel-error">{dbError}</p> : null}
 
-              <div className="db-table scroll-modern" style={{ marginTop: 12 }}>
+              <div className="db-table scroll-modern">
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr>
-                      <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 12, width: 34 }}>
-                        <input
-                          type="checkbox"
-                          checked={dbAllSelected}
-                          disabled={dbAllPkVals.length === 0 || dbBusy}
-                          onChange={(e) => {
-                            if (e.target.checked) setDbSelectedPks(dbAllPkVals);
-                            else setDbSelectedPks([]);
-                          }}
-                        />
-                      </th>
+                      {dbBazaMutable ? (
+                        <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 12, width: 34 }}>
+                          <input
+                            type="checkbox"
+                            checked={dbAllSelected}
+                            disabled={dbAllPkVals.length === 0 || dbBusy}
+                            onChange={(e) => {
+                              if (e.target.checked) setDbSelectedPks(dbAllPkVals);
+                              else setDbSelectedPks([]);
+                            }}
+                          />
+                        </th>
+                      ) : null}
                       {dbColumns.map((c) => (
-                        <th key={c} style={{ textAlign: "left", padding: "6px 8px", fontSize: 12 }}>
-                          {c}
+                        <th key={c} style={{ textAlign: "left", padding: "6px 8px", fontSize: 12 }} title={c}>
+                          {bazaColumnDisplayName(dbTable, c, t)}
                         </th>
                       ))}
-                      <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 12 }}>{t("common.actions")}</th>
+                      {dbBazaMutable ? (
+                        <th className="actions-head" style={{ padding: "6px 8px", fontSize: 12 }}>
+                          {t("common.actions")}
+                        </th>
+                      ) : null}
                     </tr>
                   </thead>
                   <tbody>
                     {dbBusy ? (
                       <tr>
-                        <td colSpan={dbColumns.length + 2} className="empty-row">
+                        <td colSpan={dbBazaColSpan} className="empty-row">
                           {t("common.loading")}
                         </td>
                       </tr>
@@ -4981,7 +5165,7 @@ function App() {
 
                     {!dbBusy && dbRows.length === 0 ? (
                       <tr>
-                        <td colSpan={dbColumns.length + 2} className="empty-row">
+                        <td colSpan={dbBazaColSpan} className="empty-row">
                           {t("baza.noRows")}
                         </td>
                       </tr>
@@ -4989,68 +5173,75 @@ function App() {
 
                     {!dbBusy && Array.isArray(dbRows)
                       ? dbRows.map((r, idx) => {
-                          const pkName = dbTableCfg?.pk?.name;
-                          const pkVal = pkName ? r[pkName] : "";
-                          const pkValStr = pkVal != null ? String(pkVal) : "";
+                          const pkValStr = dbBazaMutable ? buildDbExplorerRowPkKey(r, dbTableCfg) : "";
                           return (
-                            <tr key={pkValStr || String(idx)}>
-                              <td style={{ padding: "6px 8px", borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-                                <input
-                                  type="checkbox"
-                                  checked={dbSelectedPks.includes(pkValStr)}
-                                  disabled={dbBusy || !pkValStr}
-                                  onChange={(e) => {
-                                    const checked = e.target.checked;
-                                    setDbSelectedPks((prev) => {
-                                      if (checked) {
-                                        if (prev.includes(pkValStr)) return prev;
-                                        return [...prev, pkValStr];
-                                      }
-                                      return prev.filter((x) => x !== pkValStr);
-                                    });
-                                  }}
-                                />
-                              </td>
-                              {dbColumns.map((c) => (
-                                <td
-                                  key={c}
-                                  style={{
-                                    padding: "6px 8px",
-                                    borderTop: "1px solid rgba(0,0,0,0.06)",
-                                    verticalAlign: "top",
-                                    fontSize: 12,
-                                    maxWidth: 360,
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                  title={typeof r[c] === "object" ? formatDbValue(r[c]) : String(r[c] ?? "")}
-                                >
-                                  {formatDbValue(r[c])}
+                            <tr key={pkValStr ? pkValStr : `row-${idx}`}>
+                              {dbBazaMutable ? (
+                                <td style={{ padding: "6px 8px", borderTop: "1px solid rgba(0,0,0,0.06)" }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={dbSelectedPks.includes(pkValStr)}
+                                    disabled={dbBusy || !pkValStr}
+                                    onChange={(e) => {
+                                      const checked = e.target.checked;
+                                      setDbSelectedPks((prev) => {
+                                        if (checked) {
+                                          if (prev.includes(pkValStr)) return prev;
+                                          return [...prev, pkValStr];
+                                        }
+                                        return prev.filter((x) => x !== pkValStr);
+                                      });
+                                    }}
+                                  />
                                 </td>
-                              ))}
-                              <td style={{ padding: "6px 8px", borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-                                <div style={{ display: "flex", gap: 10 }}>
+                              ) : null}
+                              {dbColumns.map((c) => {
+                                const rawTitle =
+                                  typeof r[c] === "object" ? formatDbValue(r[c]) : String(r[c] ?? "");
+                                const colHint = bazaColumnDisplayName(dbTable, c, t);
+                                return (
+                                  <td
+                                    key={c}
+                                    style={{
+                                      padding: "6px 8px",
+                                      borderTop: "1px solid rgba(0,0,0,0.06)",
+                                      verticalAlign: "top",
+                                      fontSize: 12,
+                                      maxWidth: 360,
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                      whiteSpace: "nowrap",
+                                    }}
+                                    title={`${colHint} (${c})\n${rawTitle}`}
+                                  >
+                                    {formatDbValue(r[c])}
+                                  </td>
+                                );
+                              })}
+                              {dbBazaMutable ? (
+                                <td className="actions db-table-actions-cell">
                                   <button
                                     type="button"
                                     className="actions-icon actions-edit-btn"
                                     onClick={() => openDbEditModal(r)}
+                                    disabled={dbBusy}
                                     aria-label={t("common.edit")}
                                     title={t("common.edit")}
                                   >
-                                    <Pencil size={14} strokeWidth={1.75} />
+                                    <Pencil size={14} strokeWidth={1.75} aria-hidden />
                                   </button>
                                   <button
                                     type="button"
                                     className="actions-icon actions-delete-btn"
-                                    onClick={() => deleteDbRow(dbTable, pkVal)}
+                                    onClick={() => deleteDbRow(dbTable, pkValStr)}
+                                    disabled={dbBusy}
                                     aria-label={t("common.delete")}
                                     title={t("common.delete")}
                                   >
-                                    <Trash2 size={14} strokeWidth={1.75} />
+                                    <Trash2 size={14} strokeWidth={1.75} aria-hidden />
                                   </button>
-                                </div>
-                              </td>
+                                </td>
+                              ) : null}
                             </tr>
                           );
                         })
@@ -5063,14 +5254,14 @@ function App() {
             <section
               className={
                 activeMenu === "Sozlamalar"
-                  ? "settings-min-page scroll-modern"
+                  ? "settings-min-page journal-wrap scroll-modern"
                   : "journal-wrap module-placeholder"
               }
             >
               {activeMenu === "Sozlamalar" ? (
                 <div className="settings-min">
-                  <header className="settings-min-hero">
-                    <h1 className="settings-min-title">{t("settings.heroTitle")}</h1>
+                  <header className="journal-top-row">
+                    <h3 className="journal-title settings-min-title">{t("settings.heroTitle")}</h3>
                   </header>
 
                   {userRole === "hodim" ? (
@@ -5117,22 +5308,6 @@ function App() {
                           >
                             {theme === "light" ? <Moon size={18} strokeWidth={1.75} /> : <Sun size={18} strokeWidth={1.75} />}
                             <span>{theme === "light" ? t("settings.themeGoDark") : t("settings.themeGoLight")}</span>
-                          </button>
-                        </div>
-                        <div className="settings-min-density-row" role="group" aria-label={t("settings.densityAria")}>
-                          <button
-                            type="button"
-                            className={`settings-lang-btn${uiDensity === "normal" ? " active" : ""}`}
-                            onClick={() => setUiDensity("normal")}
-                          >
-                            {t("settings.densityNormal")}
-                          </button>
-                          <button
-                            type="button"
-                            className={`settings-lang-btn${uiDensity === "dense" ? " active" : ""}`}
-                            onClick={() => setUiDensity("dense")}
-                          >
-                            {t("settings.densityCompact")}
                           </button>
                         </div>
                       </section>
@@ -6643,16 +6818,26 @@ function App() {
                             <div className="attendance-history-entry-row">
                               <div className="attendance-history-snaps">
                                 <figure className="attendance-history-snap">
-                                  <figcaption>{t("attendance.snapshotCheckIn")}</figcaption>
+                                  <figcaption>
+                                    {rec.checkInFilial
+                                      ? `${t("attendance.snapshotCheckIn")} (${rec.checkInFilial})`
+                                      : t("attendance.snapshotCheckIn")}
+                                  </figcaption>
                                   {rec.checkInSnapshot ? (
                                     <button
                                       type="button"
                                       className="attendance-history-snap-btn"
-                                      aria-label={t("attendance.snapshotEnlarge", { kind: t("attendance.snapshotCheckIn") })}
+                                      aria-label={t("attendance.snapshotEnlarge", {
+                                        kind: rec.checkInFilial
+                                          ? `${t("attendance.snapshotCheckIn")} (${rec.checkInFilial})`
+                                          : t("attendance.snapshotCheckIn"),
+                                      })}
                                       onClick={() =>
                                         setAttendanceHistoryLightbox({
                                           src: resolveMediaUrl(rec.checkInSnapshot),
-                                          label: t("attendance.snapshotCheckIn"),
+                                          label: rec.checkInFilial
+                                            ? `${t("attendance.snapshotCheckIn")} (${rec.checkInFilial})`
+                                            : t("attendance.snapshotCheckIn"),
                                         })
                                       }
                                     >
@@ -6667,16 +6852,26 @@ function App() {
                                   )}
                                 </figure>
                                 <figure className="attendance-history-snap">
-                                  <figcaption>{t("attendance.snapshotCheckOut")}</figcaption>
+                                  <figcaption>
+                                    {rec.checkOutFilial
+                                      ? `${t("attendance.snapshotCheckOut")} (${rec.checkOutFilial})`
+                                      : t("attendance.snapshotCheckOut")}
+                                  </figcaption>
                                   {rec.checkOutSnapshot ? (
                                     <button
                                       type="button"
                                       className="attendance-history-snap-btn"
-                                      aria-label={t("attendance.snapshotEnlarge", { kind: t("attendance.snapshotCheckOut") })}
+                                      aria-label={t("attendance.snapshotEnlarge", {
+                                        kind: rec.checkOutFilial
+                                          ? `${t("attendance.snapshotCheckOut")} (${rec.checkOutFilial})`
+                                          : t("attendance.snapshotCheckOut"),
+                                      })}
                                       onClick={() =>
                                         setAttendanceHistoryLightbox({
                                           src: resolveMediaUrl(rec.checkOutSnapshot),
-                                          label: t("attendance.snapshotCheckOut"),
+                                          label: rec.checkOutFilial
+                                            ? `${t("attendance.snapshotCheckOut")} (${rec.checkOutFilial})`
+                                            : t("attendance.snapshotCheckOut"),
                                         })
                                       }
                                     >
@@ -7515,13 +7710,32 @@ function App() {
           className="modal-backdrop"
           role="presentation"
           onClick={(e) => {
-            if (e.target === e.currentTarget) setTerminalModalOpen(false);
+            if (e.target === e.currentTarget) {
+              setTerminalModalOpen(false);
+              setTerminalEditingId(null);
+            }
           }}
         >
-          <div className="modal-panel" role="dialog" aria-modal="true" aria-labelledby="terminal-create-title" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={terminalEditingId != null ? "terminal-edit-title" : "terminal-create-title"}
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="modal-header">
-              <h3 id="terminal-create-title">{t("terminal.createTitle")}</h3>
-              <button type="button" className="modal-close" onClick={() => setTerminalModalOpen(false)} aria-label={t("common.close")}>
+              <h3 id={terminalEditingId != null ? "terminal-edit-title" : "terminal-create-title"}>
+                {terminalEditingId != null ? t("terminal.editTitle") : t("terminal.createTitle")}
+              </h3>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => {
+                  setTerminalModalOpen(false);
+                  setTerminalEditingId(null);
+                }}
+                aria-label={t("common.close")}
+              >
                 <X size={15} strokeWidth={1.75} />
               </button>
             </div>
@@ -7540,13 +7754,29 @@ function App() {
                 <select
                   id="terminal-admin"
                   value={terminalForm.adminId}
-                  onChange={(e) => setTerminalForm((f) => ({ ...f, adminId: e.target.value }))}
+                  onChange={(e) => setTerminalForm((f) => ({ ...f, adminId: e.target.value, filial: "" }))}
                   required
                 >
                   <option value="">{t("common.select")}</option>
                   {terminalAdminOptions.map((u) => (
                     <option key={u.id} value={String(u.id)}>
                       {u.username}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="modal-field">
+                <label htmlFor="terminal-filial">{t("terminal.filial")}</label>
+                <select
+                  id="terminal-filial"
+                  value={terminalForm.filial}
+                  onChange={(e) => setTerminalForm((f) => ({ ...f, filial: e.target.value }))}
+                  required
+                  disabled={!terminalForm.adminId || terminalFilialOptions.length === 0}
+                >
+                  {terminalFilialOptions.map((f) => (
+                    <option key={f} value={f}>
+                      {f}
                     </option>
                   ))}
                 </select>
@@ -7596,7 +7826,14 @@ function App() {
               </div>
               {terminalSaveError ? <p className="login-err">{terminalSaveError}</p> : null}
               <div className="modal-actions">
-                <button type="button" className="modal-btn modal-btn-ghost" onClick={() => setTerminalModalOpen(false)}>
+                <button
+                  type="button"
+                  className="modal-btn modal-btn-ghost"
+                  onClick={() => {
+                    setTerminalModalOpen(false);
+                    setTerminalEditingId(null);
+                  }}
+                >
                   {t("common.cancelShort")}
                 </button>
                 <button type="submit" className="modal-btn modal-btn-primary" disabled={terminalSaveBusy}>
@@ -7884,7 +8121,10 @@ function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-header">
-              <h3 id="db-edit-title">{t("baza.editRowTitle")}</h3>
+              <h3 id="db-edit-title">
+                {t("baza.editRowTitle")}
+                {dbEditTable ? ` — ${bazaTableDisplayName(dbEditTable, t)}` : ""}
+              </h3>
               <button type="button" className="modal-close" onClick={closeDbEditModal} aria-label={t("common.close")}>
                 <X size={15} strokeWidth={1.75} />
               </button>
@@ -7899,7 +8139,7 @@ function App() {
                   return editableCols.map((c) => {
                     const name = c.name;
                     const type = c.type;
-                    const label = name;
+                    const label = bazaColumnDisplayName(dbEditTable, name, t);
                     const val = dbEditDraft?.[name];
                     if (type === "boolean") {
                       return (

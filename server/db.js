@@ -166,6 +166,7 @@ export async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_admin_salary_calc_configs_admin_id ON admin_salary_calc_configs(admin_id);
     CREATE INDEX IF NOT EXISTS idx_admin_filial_map_admin_id ON admin_filial_map(admin_id);
     CREATE INDEX IF NOT EXISTS idx_terminals_admin_id ON terminals(admin_id);
+    ALTER TABLE terminals ADD COLUMN IF NOT EXISTS filial TEXT;
     CREATE INDEX IF NOT EXISTS idx_employees_admin_id ON employees(admin_id);
     CREATE INDEX IF NOT EXISTS idx_employee_attendance_admin_id ON employee_attendance(admin_id);
     CREATE INDEX IF NOT EXISTS idx_employee_salary_overrides_admin_id ON employee_salary_overrides(admin_id);
@@ -178,6 +179,8 @@ export async function initSchema() {
     ALTER TABLE employees ADD COLUMN IF NOT EXISTS access_card_no TEXT;
     ALTER TABLE employee_attendance ADD COLUMN IF NOT EXISTS check_in_snapshot TEXT;
     ALTER TABLE employee_attendance ADD COLUMN IF NOT EXISTS check_out_snapshot TEXT;
+    ALTER TABLE employee_attendance ADD COLUMN IF NOT EXISTS check_in_filial TEXT;
+    ALTER TABLE employee_attendance ADD COLUMN IF NOT EXISTS check_out_filial TEXT;
 
     CREATE TABLE IF NOT EXISTS terminal_poll_cursors (
       terminal_id INTEGER PRIMARY KEY REFERENCES terminals(id) ON DELETE CASCADE,

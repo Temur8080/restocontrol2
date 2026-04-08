@@ -743,14 +743,14 @@ async function findTerminalRow(pool, deviceIpNorm, clientIpNorm, preferredTermin
   const tid = preferredTerminalId != null ? Number.parseInt(String(preferredTerminalId), 10) : NaN;
   if (Number.isFinite(tid)) {
     const { rows: one } = await pool.query(
-      `SELECT id, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE id = $1`,
+      `SELECT id, admin_id, terminal_type, ip_address, login, password, filial FROM terminals WHERE id = $1`,
       [tid]
     );
     if (one[0]) return one[0];
   }
 
   const { rows } = await pool.query(
-    `SELECT id, admin_id, terminal_type, ip_address, login, password FROM terminals ORDER BY id ASC`
+    `SELECT id, admin_id, terminal_type, ip_address, login, password, filial FROM terminals ORDER BY id ASC`
   );
 
   const collect = (ip) => {

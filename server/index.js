@@ -19,6 +19,12 @@ import {
 } from "./webhookGuards.js";
 import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.js";
 import { batchDownloadPendingAttendanceSnapshots } from "./attendanceFaceImages.js";
+import {
+  assertSafeSqlIdentifier,
+  buildDynamicReadOnlyTableConfig,
+  listPublicBaseTables,
+  quoteIdent,
+} from "./dbExplorer.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -115,6 +121,8 @@ function rowToAttendance(row) {
   } else if (typeof d === "string" && d.length > 10) d = d.slice(0, 10);
   const cinS = row.check_in_snapshot != null ? String(row.check_in_snapshot).trim() : "";
   const coutS = row.check_out_snapshot != null ? String(row.check_out_snapshot).trim() : "";
+  const cinF = row.check_in_filial != null ? String(row.check_in_filial).trim() : "";
+  const coutF = row.check_out_filial != null ? String(row.check_out_filial).trim() : "";
   return {
     id: Number(row.id),
     employeeId: Number(row.employee_id),
@@ -124,6 +132,8 @@ function rowToAttendance(row) {
     late: !!row.late,
     checkInSnapshot: cinS || null,
     checkOutSnapshot: coutS || null,
+    checkInFilial: cinF || null,
+    checkOutFilial: coutF || null,
   };
 }
 
@@ -300,6 +310,7 @@ const DB_TABLE_CONFIG = {
     pk: { name: "id", type: "int" },
     columns: {
       id: { type: "int", editable: false, visible: true },
+      admin_id: { type: "int", editable: true, visible: true },
       name: { type: "text", editable: true, visible: true },
       role: { type: "text", editable: true, visible: true },
       filial: { type: "text", editable: true, visible: true },
@@ -321,11 +332,20 @@ const DB_TABLE_CONFIG = {
       late: { type: "boolean", editable: true, visible: true },
       check_in_snapshot: { type: "text", editable: false, visible: false },
       check_out_snapshot: { type: "text", editable: false, visible: false },
+      check_in_filial: { type: "text", editable: false, visible: false },
+      check_out_filial: { type: "text", editable: false, visible: false },
     },
   },
   role_salaries: {
-    pk: { name: "role_name", type: "text" },
+    compositePk: true,
+    pk: null,
+    orderBy: "admin_id",
+    pkColumns: [
+      { name: "admin_id", type: "int" },
+      { name: "role_name", type: "text" },
+    ],
     columns: {
+      admin_id: { type: "int", editable: false, visible: true },
       role_name: { type: "text", editable: false, visible: true },
       amount: { type: "int", editable: true, visible: true },
       salary_type: { type: "text", editable: true, visible: true },
@@ -372,6 +392,7 @@ const DB_TABLE_CONFIG = {
     pk: { name: "id", type: "int" },
     columns: {
       id: { type: "int", editable: false, visible: true },
+      admin_id: { type: "int", editable: true, visible: true },
       username: { type: "text", editable: true, visible: true },
       role: { type: "text", editable: true, visible: true },
       employee_id: { type: "int", editable: true, visible: true },
@@ -388,6 +409,7 @@ const DB_TABLE_CONFIG = {
       terminal_name: { type: "text", editable: true, visible: true },
       admin_id: { type: "int", editable: true, visible: true },
       terminal_type: { type: "text", editable: true, visible: true },
+      filial: { type: "text", editable: true, visible: true },
       ip_address: { type: "text", editable: true, visible: true },
       login: { type: "text", editable: true, visible: true },
       password: { type: "text", editable: true, visible: true },
@@ -403,8 +425,42 @@ const DB_TABLE_CONFIG = {
   },
 };
 
-function getDbConfig(table) {
-  return DB_TABLE_CONFIG[String(table)] || null;
+/** Baza explorer: ma'lum jadval uchun static yoki DB'dan o'qilgan config. */
+const explorerDynamicConfigCache = new Map();
+
+async function resolveExplorerTableConfig(pool, table) {
+  let t;
+  try {
+    t = assertSafeSqlIdentifier(String(table || ""));
+  } catch {
+    return null;
+  }
+  if (DB_TABLE_CONFIG[t]) {
+    const c = DB_TABLE_CONFIG[t];
+    const readOnly = c.explorerReadOnly === true;
+    const orderBy = c.orderBy || c.pk?.name;
+    if (!orderBy) {
+      return null;
+    }
+    const pkColumns =
+      Array.isArray(c.pkColumns) && c.pkColumns.length > 0
+        ? c.pkColumns
+        : c.pk?.name
+          ? [{ name: c.pk.name, type: c.pk.type }]
+          : [];
+    return {
+      ...c,
+      readOnly,
+      orderBy,
+      compositePk: !!c.compositePk,
+      pkColumns,
+    };
+  }
+  if (explorerDynamicConfigCache.has(t)) return explorerDynamicConfigCache.get(t);
+  const dyn = await buildDynamicReadOnlyTableConfig(pool, t);
+  if (!dyn) return null;
+  explorerDynamicConfigCache.set(t, dyn);
+  return dyn;
 }
 
 function castForType(type) {
@@ -414,6 +470,8 @@ function castForType(type) {
   if (type === "jsonb") return "jsonb";
   if (type === "date") return "date";
   if (type === "timestamptz") return "timestamptz";
+  if (type === "float") return "double precision";
+  if (type === "numeric") return "numeric";
   return "text";
 }
 
@@ -428,6 +486,16 @@ function normalizeValueForType(type, value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return null;
     return Math.trunc(n);
+  }
+  if (type === "float") {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    return n;
+  }
+  if (type === "numeric") {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    return n;
   }
   if (type === "bigint") {
     const s = String(value).trim();
@@ -461,19 +529,82 @@ function normalizeValueForType(type, value) {
   return String(value);
 }
 
+/** Baza explorer: kompozit PK URL segment — JSON obyekt (fetch bir marta encodeURIComponent qiladi). */
+function parseCompositePkObject(pkValRaw) {
+  const s = String(pkValRaw ?? "").trim();
+  if (!s) return null;
+  try {
+    const obj = JSON.parse(s);
+    if (obj && typeof obj === "object" && !Array.isArray(obj)) return obj;
+  } catch {
+    /* keyingi urinish */
+  }
+  try {
+    const obj = JSON.parse(decodeURIComponent(s));
+    if (obj && typeof obj === "object" && !Array.isArray(obj)) return obj;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function pkWhereClauseAndParams(cfg, pkValRaw) {
+  const hasComposite = cfg.compositePk && Array.isArray(cfg.pkColumns) && cfg.pkColumns.length > 0;
+  const hasSingle = cfg.pk?.name;
+  if (hasComposite) {
+    const obj = parseCompositePkObject(pkValRaw);
+    if (!obj) return { error: "Noto'g'ri yoki noto'liq primary key" };
+    const parts = [];
+    for (const { name, type } of cfg.pkColumns) {
+      if (!Object.prototype.hasOwnProperty.call(obj, name)) {
+        return { error: `PK maydoni yetishmayapti: ${name}` };
+      }
+      const normalized = normalizeValueForType(type, obj[name]);
+      parts.push({ name, type, normalized });
+    }
+    return { composite: true, parts };
+  }
+  if (hasSingle) {
+    const normalized = normalizeValueForType(cfg.pk.type, pkValRaw);
+    return {
+      composite: false,
+      parts: [{ name: cfg.pk.name, type: cfg.pk.type, normalized }],
+    };
+  }
+  return { error: "PK aniqlanmadi" };
+}
+
 api.get("/db/meta", async (req, res) => {
   try {
     if (!requireSuperadmin(req, res)) return;
-    const tables = Object.keys(DB_TABLE_CONFIG).map((t) => {
-      const cfg = DB_TABLE_CONFIG[t];
-      return {
-        name: t,
-        pk: cfg.pk,
-        columns: Object.entries(cfg.columns)
-          .map(([name, col]) => ({ name, ...col }))
-          .filter((c) => c.visible),
-      };
-    });
+    let pub = [];
+    try {
+      pub = await listPublicBaseTables(pool);
+    } catch (e) {
+      console.warn("[db/meta] public jadvallarni olishda xato, faqat statik ro'yxat:", e);
+      pub = [];
+    }
+    const staticKeys = Object.keys(DB_TABLE_CONFIG);
+    const names = [...new Set([...pub, ...staticKeys])].sort((a, b) => a.localeCompare(b));
+    const tables = [];
+    for (const name of names) {
+      try {
+        const cfg = await resolveExplorerTableConfig(pool, name);
+        if (!cfg) continue;
+        tables.push({
+          name,
+          readOnly: !!cfg.readOnly,
+          compositePk: !!cfg.compositePk,
+          pk: cfg.pk,
+          pkColumns: Array.isArray(cfg.pkColumns) ? cfg.pkColumns : [],
+          columns: Object.entries(cfg.columns)
+            .map(([colName, col]) => ({ name: colName, ...col }))
+            .filter((c) => c.visible),
+        });
+      } catch (e) {
+        console.warn(`[db/meta] jadval "${name}" o'tkazib yuborildi:`, e);
+      }
+    }
     res.json({ tables });
   } catch (err) {
     console.error(err);
@@ -485,48 +616,74 @@ api.get("/db/table/:table", async (req, res) => {
   try {
     if (!requireSuperadmin(req, res)) return;
     const table = String(req.params.table);
-    const cfg = getDbConfig(table);
+    const cfg = await resolveExplorerTableConfig(pool, table);
     if (!cfg) return res.status(404).json({ error: "Bunday jadval yo'q" });
 
     const adminIdIn = req.query.adminId ? String(req.query.adminId) : "";
     const employeeIdIn = req.query.employeeId ? String(req.query.employeeId) : "";
     const adminId = adminIdIn ? Number.parseInt(adminIdIn, 10) : null;
     const employeeId = employeeIdIn ? Number.parseInt(employeeIdIn, 10) : null;
+    const adminIdOk = adminId != null && Number.isFinite(adminId);
+    const employeeIdOk = employeeId != null && Number.isFinite(employeeId);
+
+    /** `public` jadvalda `admin_id` bor-yo‘qligini static ro‘yxat va metadata orqali aniqlash */
+    const TABLES_WITH_ADMIN_ID = new Set([
+      "employees",
+      "employee_attendance",
+      "terminals",
+      "employee_salary_payments",
+      "employee_salary_adjustments",
+      "admin_filial_map",
+      "admin_salary_calc_configs",
+      "role_salaries",
+      "employee_salary_overrides",
+      "app_kv",
+    ]);
 
     const visibleCols = Object.entries(cfg.columns)
       .filter(([, c]) => c.visible)
       .map(([name]) => name);
 
-    const selects = visibleCols.join(", ");
+    const selects = visibleCols.map((c) => quoteIdent(c)).join(", ");
+    const orderCol = cfg.orderBy || cfg.pk?.name;
+    if (!orderCol) {
+      return res.status(500).json({ error: "Jadval uchun tartib ustuni aniqlanmadi" });
+    }
 
-    let where = "";
+    const conditions = [];
     const params = [];
+    let p = 1;
 
-    if (table === "users" && adminId != null) {
-      where = `WHERE id = $1`;
-      params.push(adminId);
-    }
-    if (table === "employees" && employeeId != null) {
-      where = `WHERE id = $1`;
-      params.push(employeeId);
-    }
-    if (table === "employee_attendance" && employeeId != null) {
-      where = `WHERE employee_id = $1`;
-      params.push(employeeId);
-    }
-    if (table === "employee_salary_overrides" && employeeId != null) {
-      where = `WHERE employee_id = $1`;
-      params.push(employeeId);
-    }
-
-    if (
-      (table === "employee_attendance" || table === "employee_salary_overrides") &&
-      employeeId == null
-    ) {
-      return res.json({ columns: visibleCols, rows: [] });
+    if (adminIdOk) {
+      if (table === "users") {
+        /* Tanlangan adminning o‘zi (id) va unga biriktirilgan foydalanuvchilar (admin_id) */
+        conditions.push(
+          `(${quoteIdent("id")} = $${p} OR ${quoteIdent("admin_id")} = $${p})`
+        );
+        params.push(adminId);
+        p++;
+      } else if (cfg.columns && Object.prototype.hasOwnProperty.call(cfg.columns, "admin_id")) {
+        conditions.push(`${quoteIdent("admin_id")} = $${p++}`);
+        params.push(adminId);
+      } else if (TABLES_WITH_ADMIN_ID.has(table)) {
+        conditions.push(`${quoteIdent("admin_id")} = $${p++}`);
+        params.push(adminId);
+      }
     }
 
-    const q = `SELECT ${selects} FROM ${table} ${where} ORDER BY ${cfg.pk.name} ASC`;
+    if (employeeIdOk) {
+      if (table === "employees") {
+        conditions.push(`${quoteIdent("id")} = $${p++}`);
+        params.push(employeeId);
+      } else if (cfg.columns && Object.prototype.hasOwnProperty.call(cfg.columns, "employee_id")) {
+        conditions.push(`${quoteIdent("employee_id")} = $${p++}`);
+        params.push(employeeId);
+      }
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const q = `SELECT ${selects} FROM ${quoteIdent(table)} ${where} ORDER BY ${quoteIdent(orderCol)} ASC`;
     const r = await pool.query(q, params);
     res.json({ columns: visibleCols, rows: r.rows });
   } catch (err) {
@@ -539,9 +696,16 @@ api.patch("/db/table/:table/:pkVal", async (req, res) => {
   try {
     if (!requireSuperadmin(req, res)) return;
     const table = String(req.params.table);
-    const cfg = getDbConfig(table);
+    const cfg = await resolveExplorerTableConfig(pool, table);
     if (!cfg) return res.status(404).json({ error: "Bunday jadval yo'q" });
-    const pkValRaw = String(req.params.pkVal);
+    if (cfg.readOnly) {
+      return res.status(403).json({ error: "Bu jadval faqat ko'rish rejimida" });
+    }
+    const pkValRaw = req.params.pkVal;
+    const pkBits = pkWhereClauseAndParams(cfg, pkValRaw);
+    if (pkBits.error) {
+      return res.status(400).json({ error: pkBits.error });
+    }
     const data = req.body?.data && typeof req.body.data === "object" ? req.body.data : req.body || {};
 
     const editable = Object.entries(cfg.columns)
@@ -556,15 +720,17 @@ api.patch("/db/table/:table/:pkVal", async (req, res) => {
       const colCfg = cfg.columns[col];
       const type = colCfg.type;
       const normalized = normalizeValueForType(type, data[col]);
-      updates.push(`${col} = $${params.length + 1}::${castForType(type)}`);
+      updates.push(`${quoteIdent(col)} = $${params.length + 1}::${castForType(type)}`);
       params.push(normalized);
     }
 
     if (updates.length === 0) return res.status(400).json({ error: "Hech narsa o'zgarmadi" });
 
-    const pkTypeCast = castForType(cfg.pk.type);
-    const q = `UPDATE ${table} SET ${updates.join(", ")} WHERE ${cfg.pk.name} = $${params.length + 1}::${pkTypeCast}`;
-    params.push(pkValRaw);
+    const whParts = pkBits.parts.map((part) => {
+      params.push(part.normalized);
+      return `${quoteIdent(part.name)} = $${params.length}::${castForType(part.type)}`;
+    });
+    const q = `UPDATE ${quoteIdent(table)} SET ${updates.join(", ")} WHERE ${whParts.join(" AND ")}`;
 
     await pool.query(q, params);
     res.status(204).send();
@@ -578,13 +744,23 @@ api.delete("/db/table/:table/:pkVal", async (req, res) => {
   try {
     if (!requireSuperadmin(req, res)) return;
     const table = String(req.params.table);
-    const cfg = getDbConfig(table);
+    const cfg = await resolveExplorerTableConfig(pool, table);
     if (!cfg) return res.status(404).json({ error: "Bunday jadval yo'q" });
-    const pkValRaw = String(req.params.pkVal);
-
-    const pkTypeCast = castForType(cfg.pk.type);
-    const q = `DELETE FROM ${table} WHERE ${cfg.pk.name} = $1::${pkTypeCast}`;
-    const r = await pool.query(q, [pkValRaw]);
+    if (cfg.readOnly) {
+      return res.status(403).json({ error: "Bu jadval faqat ko'rish rejimida" });
+    }
+    const pkValRaw = req.params.pkVal;
+    const pkBits = pkWhereClauseAndParams(cfg, pkValRaw);
+    if (pkBits.error) {
+      return res.status(400).json({ error: pkBits.error });
+    }
+    const params = [];
+    const whParts = pkBits.parts.map((part) => {
+      params.push(part.normalized);
+      return `${quoteIdent(part.name)} = $${params.length}::${castForType(part.type)}`;
+    });
+    const q = `DELETE FROM ${quoteIdent(table)} WHERE ${whParts.join(" AND ")}`;
+    const r = await pool.query(q, params);
     if (r.rowCount === 0) return res.status(404).json({ error: "Topilmadi" });
     res.status(204).send();
   } catch (err) {
@@ -597,15 +773,36 @@ api.post("/db/table/:table/bulk-delete", async (req, res) => {
   try {
     if (!requireSuperadmin(req, res)) return;
     const table = String(req.params.table);
-    const cfg = getDbConfig(table);
+    const cfg = await resolveExplorerTableConfig(pool, table);
     if (!cfg) return res.status(404).json({ error: "Bunday jadval yo'q" });
+    if (cfg.readOnly) {
+      return res.status(403).json({ error: "Bu jadval faqat ko'rish rejimida" });
+    }
     const pks = req.body?.pks;
     const list = Array.isArray(pks) ? pks.map((x) => String(x)).filter((x) => x) : [];
     if (list.length === 0) return res.status(400).json({ error: "pks bo'sh" });
 
-    const pkTypeCast = castForType(cfg.pk.type);
-    const q = `DELETE FROM ${table} WHERE ${cfg.pk.name} = ANY($1::${pkTypeCast}[])`;
-    await pool.query(q, [list]);
+    if (cfg.compositePk && Array.isArray(cfg.pkColumns) && cfg.pkColumns.length > 0) {
+      const ors = [];
+      const params = [];
+      for (const enc of list) {
+        const pkBits = pkWhereClauseAndParams(cfg, enc);
+        if (pkBits.error) return res.status(400).json({ error: pkBits.error });
+        const ands = pkBits.parts.map((part) => {
+          params.push(part.normalized);
+          return `${quoteIdent(part.name)} = $${params.length}::${castForType(part.type)}`;
+        });
+        ors.push(`(${ands.join(" AND ")})`);
+      }
+      const q = `DELETE FROM ${quoteIdent(table)} WHERE ${ors.join(" OR ")}`;
+      await pool.query(q, params);
+    } else if (cfg.pk?.name) {
+      const pkTypeCast = castForType(cfg.pk.type);
+      const q = `DELETE FROM ${quoteIdent(table)} WHERE ${quoteIdent(cfg.pk.name)} = ANY($1::${pkTypeCast}[])`;
+      await pool.query(q, [list]);
+    } else {
+      return res.status(403).json({ error: "Bu jadval uchun PK aniqlanmadi" });
+    }
     res.status(204).send();
   } catch (err) {
     console.error(err);
@@ -869,11 +1066,29 @@ api.delete("/users/:id", async (req, res) => {
   }
 });
 
+async function resolveTerminalFilialForSave(pool, adminId, rawFilial) {
+  const adminIdNum = Number(adminId);
+  if (!Number.isFinite(adminIdNum)) return null;
+  const s = String(rawFilial ?? "").trim();
+  const { rows: mapRows } = await pool.query(
+    `SELECT filial FROM admin_filial_map WHERE admin_id = $1 ORDER BY filial ASC`,
+    [adminIdNum]
+  );
+  if (s === "") {
+    if (mapRows.length === 0) return "Asosiy filial";
+    return String(mapRows[0].filial).trim();
+  }
+  const allowed = new Set(mapRows.map((r) => String(r.filial).trim()));
+  if (allowed.has(s)) return s;
+  if (mapRows.length === 0 && s === "Asosiy filial") return s;
+  return null;
+}
+
 api.get("/terminals", async (req, res) => {
   try {
     if (!requireSuperadmin(req, res)) return;
     const { rows } = await pool.query(
-      `SELECT t.id, t.terminal_name, t.admin_id, t.terminal_type, t.ip_address, t.login, t.password, t.created_at,
+      `SELECT t.id, t.terminal_name, t.admin_id, t.terminal_type, t.filial, t.ip_address, t.login, t.password, t.created_at,
               u.username AS admin_username
        FROM terminals t
        JOIN users u ON u.id = t.admin_id
@@ -895,19 +1110,72 @@ api.post("/terminals", async (req, res) => {
     const ipAddress = String(req.body?.ipAddress || "").trim();
     const login = String(req.body?.login || "").trim();
     const password = String(req.body?.password || "").trim();
+    const filialRaw = req.body?.filial;
     const terminalType = terminalTypeIn === "Chiqish" ? "Chiqish" : "Kirish";
     if (!terminalName || !Number.isFinite(adminId) || !ipAddress || !login || !password) {
       return res.status(400).json({ error: "Barcha maydonlar majburiy" });
     }
     const adminR = await pool.query(`SELECT id FROM users WHERE id = $1 AND role = 'admin'`, [adminId]);
     if (adminR.rows.length === 0) return res.status(400).json({ error: "Admin topilmadi" });
+    const filialVal = await resolveTerminalFilialForSave(pool, adminId, filialRaw);
+    if (filialVal == null) return res.status(400).json({ error: "Filial admin ro‘yxatida yo‘q yoki noto‘g‘ri" });
     const { rows } = await pool.query(
-      `INSERT INTO terminals (terminal_name, admin_id, terminal_type, ip_address, login, password)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, terminal_name, admin_id, terminal_type, ip_address, login, password, created_at`,
-      [terminalName, adminId, terminalType, ipAddress, login, password]
+      `INSERT INTO terminals (terminal_name, admin_id, terminal_type, filial, ip_address, login, password)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, terminal_name, admin_id, terminal_type, filial, ip_address, login, password, created_at`,
+      [terminalName, adminId, terminalType, filialVal, ipAddress, login, password]
     );
     res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+api.patch("/terminals/:id", async (req, res) => {
+  try {
+    if (!requireSuperadmin(req, res)) return;
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Noto'g'ri id" });
+    const terminalName = String(req.body?.terminalName || "").trim();
+    const adminId = Number.parseInt(String(req.body?.adminId || ""), 10);
+    const terminalTypeIn = String(req.body?.terminalType || "").trim();
+    const ipAddress = String(req.body?.ipAddress || "").trim();
+    const login = String(req.body?.login || "").trim();
+    const password = String(req.body?.password || "").trim();
+    const filialRaw = req.body?.filial;
+    const terminalType = terminalTypeIn === "Chiqish" ? "Chiqish" : "Kirish";
+    if (!terminalName || !Number.isFinite(adminId) || !ipAddress || !login || !password) {
+      return res.status(400).json({ error: "Barcha maydonlar majburiy" });
+    }
+    const adminR = await pool.query(`SELECT id FROM users WHERE id = $1 AND role = 'admin'`, [adminId]);
+    if (adminR.rows.length === 0) return res.status(400).json({ error: "Admin topilmadi" });
+    const filialVal = await resolveTerminalFilialForSave(pool, adminId, filialRaw);
+    if (filialVal == null) return res.status(400).json({ error: "Filial admin ro‘yxatida yo‘q yoki noto‘g‘ri" });
+    const upd = await pool.query(
+      `UPDATE terminals SET terminal_name = $1, admin_id = $2, terminal_type = $3, filial = $4, ip_address = $5, login = $6, password = $7
+       WHERE id = $8
+       RETURNING id, terminal_name, admin_id, terminal_type, filial, ip_address, login, password, created_at`,
+      [terminalName, adminId, terminalType, filialVal, ipAddress, login, password, id]
+    );
+    if (upd.rows.length === 0) return res.status(404).json({ error: "Terminal topilmadi" });
+    const row = upd.rows[0];
+    const u = await pool.query(`SELECT username AS admin_username FROM users WHERE id = $1`, [row.admin_id]);
+    res.json({ ...row, admin_username: u.rows[0]?.admin_username ?? null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+api.delete("/terminals/:id", async (req, res) => {
+  try {
+    if (!requireSuperadmin(req, res)) return;
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "Noto'g'ri id" });
+    const r = await pool.query(`DELETE FROM terminals WHERE id = $1`, [id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: "Terminal topilmadi" });
+    res.status(204).send();
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
@@ -944,7 +1212,7 @@ api.post("/terminals/:id/sync-employees", async (req, res) => {
     const id = Number.parseInt(req.params.id, 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "Noto'g'ri id" });
     const { rows } = await pool.query(
-      `SELECT id, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE id = $1`,
+      `SELECT id, admin_id, terminal_type, ip_address, login, password, filial FROM terminals WHERE id = $1`,
       [id]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Terminal topilmadi" });
@@ -972,7 +1240,7 @@ api.post("/terminals/sync-all-my-employees", async (req, res) => {
     }
     const adminId = req.auth.sub;
     const { rows } = await pool.query(
-      `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE admin_id = $1 ORDER BY id`,
+      `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password, filial FROM terminals WHERE admin_id = $1 ORDER BY id`,
       [adminId]
     );
     const result = await runSyncEmployeesAcrossTerminals(rows);
@@ -991,12 +1259,12 @@ api.post("/employees/generate-from-terminals", async (req, res) => {
     let rows;
     if (req.auth?.role === "superadmin") {
       const r = await pool.query(
-        `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password FROM terminals ORDER BY id`
+        `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password, filial FROM terminals ORDER BY id`
       );
       rows = r.rows;
     } else {
       const r = await pool.query(
-        `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password FROM terminals WHERE admin_id = $1 ORDER BY id`,
+        `SELECT id, terminal_name, admin_id, terminal_type, ip_address, login, password, filial FROM terminals WHERE admin_id = $1 ORDER BY id`,
         [req.auth.sub]
       );
       rows = r.rows;
@@ -1086,7 +1354,8 @@ api.get("/bootstrap", async (req, res) => {
       );
       scopedAdminId = empR.rows[0]?.admin_id ?? null;
       attR = await pool.query(
-        `SELECT id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot
+        `SELECT id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot,
+                check_in_filial, check_out_filial
          FROM employee_attendance WHERE employee_id = $1 ORDER BY id ASC`,
         [myEmployeeId]
       );
@@ -1124,7 +1393,7 @@ api.get("/bootstrap", async (req, res) => {
         isAdmin
           ? pool.query(
               `SELECT a.id, a.employee_id, a.record_date, a.check_in, a.check_out, a.late,
-                      a.check_in_snapshot, a.check_out_snapshot
+                      a.check_in_snapshot, a.check_out_snapshot, a.check_in_filial, a.check_out_filial
                FROM employee_attendance a
                JOIN employees e ON e.id = a.employee_id
                WHERE e.admin_id = $1
@@ -1132,7 +1401,8 @@ api.get("/bootstrap", async (req, res) => {
               [scopedAdminId]
             )
           : pool.query(
-              `SELECT id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot
+              `SELECT id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot,
+                      check_in_filial, check_out_filial
                FROM employee_attendance ORDER BY id ASC`
             ),
         isAdmin
@@ -1436,9 +1706,9 @@ api.post("/attendance", async (req, res) => {
     const lateComputed = computeCheckInLateFlag(empShift.rows[0], date, String(checkIn).trim(), grace);
 
     const { rows } = await pool.query(
-      `INSERT INTO employee_attendance (admin_id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot)
-       VALUES ($1, $2, $3::date, $4, $5, $6, NULL, NULL)
-       RETURNING id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot`,
+      `INSERT INTO employee_attendance (admin_id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot, check_in_filial, check_out_filial)
+       VALUES ($1, $2, $3::date, $4, $5, $6, NULL, NULL, NULL, NULL)
+       RETURNING id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot, check_in_filial, check_out_filial`,
       [adm, eid, date, String(checkIn).trim(), co, lateComputed]
     );
     res.status(201).json(rowToAttendance(rows[0]));
@@ -1465,7 +1735,8 @@ api.patch("/attendance/:id", async (req, res) => {
        WHERE a.id = $2 AND e.id = a.employee_id ${
          req.auth?.role === "admin" ? "AND e.admin_id = $3" : ""
        }
-       RETURNING a.id, a.employee_id, a.record_date, a.check_in, a.check_out, a.late, a.check_in_snapshot, a.check_out_snapshot`,
+       RETURNING a.id, a.employee_id, a.record_date, a.check_in, a.check_out, a.late, a.check_in_snapshot, a.check_out_snapshot,
+         a.check_in_filial, a.check_out_filial`,
       req.auth?.role === "admin" ? [co, id, req.auth?.sub] : [co, id]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Topilmadi" });

@@ -16,6 +16,26 @@ import { employeeMatchByNormalizedNameSql, employeeMatchByAccessCardSql } from "
 import { isCheckoutTerminalType, isExitLikeAccessEvent } from "./hikvisionAccessDirection.js";
 import { isPrivateLanHostname } from "./terminalProbe.js";
 
+/**
+ * Terminal avtomatik qo‘ygan "Hodim {id}" yoki bo‘sh ism — keyingi hodisalar/sinxron boshqa
+ * terminaldagi boshqacha yozuvdan ustidan yozishi mumkin. Haqiqiy F.I.Sh allaqachon
+ * kiritilgan bo‘lsa, turli qurilmalarda bir xil ID uchun farq qiluvchi ismlarni almashtirmaymiz.
+ */
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function isPlaceholderOrAutoHodimName(normalizedDbName, terminalKey) {
+  const n = normalizeEmployeeEventName(normalizedDbName);
+  const key = String(terminalKey || "").trim();
+  const compact = n.replace(/\s+/g, " ").trim();
+  if (!compact) return true;
+  if (key) {
+    return new RegExp(`^Hodim\\s+${escapeRegExp(key)}$`, "i").test(compact);
+  }
+  return /^Hodim\s+\S+$/i.test(compact);
+}
+
 export function rowToAttendanceRow(row) {
   if (!row) return null;
   let d = row.record_date;
@@ -27,6 +47,8 @@ export function rowToAttendanceRow(row) {
   } else if (typeof d === "string" && d.length > 10) d = d.slice(0, 10);
   const cinS = row.check_in_snapshot != null ? String(row.check_in_snapshot).trim() : "";
   const coutS = row.check_out_snapshot != null ? String(row.check_out_snapshot).trim() : "";
+  const cinF = row.check_in_filial != null ? String(row.check_in_filial).trim() : "";
+  const coutF = row.check_out_filial != null ? String(row.check_out_filial).trim() : "";
   return {
     id: Number(row.id),
     employeeId: Number(row.employee_id),
@@ -36,6 +58,8 @@ export function rowToAttendanceRow(row) {
     late: !!row.late,
     checkInSnapshot: cinS || null,
     checkOutSnapshot: coutS || null,
+    checkInFilial: cinF || null,
+    checkOutFilial: coutF || null,
   };
 }
 
@@ -49,8 +73,23 @@ async function getDefaultFilialForAdmin(pool, adminId) {
     : "Asosiy filial";
 }
 
+/** Terminalga biriktirilgan filial (admin_filial_map bo‘yicha) yoki admin uchun birlamchi. */
+export async function resolveEmployeeFilialForTerminal(pool, terminalRow) {
+  const adminId = Number(terminalRow?.admin_id);
+  if (!Number.isFinite(adminId)) return "Asosiy filial";
+  const tf = terminalRow.filial != null ? String(terminalRow.filial).trim() : "";
+  if (tf) {
+    const { rows } = await pool.query(
+      `SELECT filial FROM admin_filial_map WHERE admin_id = $1 AND filial = $2 LIMIT 1`,
+      [adminId, tf]
+    );
+    if (rows.length > 0) return String(rows[0].filial).trim();
+  }
+  return getDefaultFilialForAdmin(pool, adminId);
+}
+
 /**
- * Terminaldan hodimlar: faqat ism (qurilma id/karta raqami bazaga yozilmaydi).
+ * Terminaldan hodimlar (Hikvision UserInfo): ism va employeeNo/karta `access_card_no` ga yoziladi.
  */
 export async function syncEmployeesFromTerminal(pool, terminalRow) {
   const norm = normalizeTerminalBaseUrl(terminalRow.ip_address);
@@ -110,7 +149,7 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     };
   }
 
-  const defaultFilial = await getDefaultFilialForAdmin(pool, adminId);
+  const defaultFilial = await resolveEmployeeFilialForTerminal(pool, terminalRow);
   let created = 0;
   let updated = 0;
 
@@ -118,10 +157,41 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     const nm = normalizeEmployeeEventName(u.name || "");
     if (!nm) continue;
 
+    const terminalKey =
+      u.employeeNo != null && String(u.employeeNo).trim() !== "" ? String(u.employeeNo).trim() : "";
+    if (terminalKey) {
+      const byCard = await pool.query(
+        `SELECT id, name, access_card_no FROM employees e
+         WHERE ${employeeMatchByAccessCardSql}
+         ORDER BY e.id ASC
+         LIMIT 1`,
+        [adminId, terminalKey]
+      );
+      if (byCard.rows.length > 0) {
+        const row = byCard.rows[0];
+        const prevName = normalizeEmployeeEventName(row.name);
+        const prevCard = String(row.access_card_no || "").trim();
+        const allowNameFromTerminal = isPlaceholderOrAutoHodimName(prevName, terminalKey);
+        const nameToStore = allowNameFromTerminal ? nm : prevName;
+        const nameChanged = allowNameFromTerminal && nameToStore !== prevName;
+        const cardChanged = prevCard !== terminalKey;
+        if (nameChanged || cardChanged) {
+          await pool.query(`UPDATE employees SET name = $1, access_card_no = $2 WHERE id = $3`, [
+            nameToStore || nm,
+            terminalKey,
+            row.id,
+          ]);
+          updated += 1;
+        }
+        continue;
+      }
+    }
+
     const byName = await pool.query(
       `SELECT id, name, access_card_no FROM employees
        WHERE admin_id = $1
          AND LOWER(TRIM(REGEXP_REPLACE(TRIM(COALESCE(name, '')), E'\\\\s+', ' ', 'g'))) = LOWER($2::text)
+       ORDER BY id ASC
        LIMIT 1`,
       [adminId, nm]
     );
@@ -136,11 +206,19 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
       continue;
     }
 
-    await pool.query(
-      `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end)
-       VALUES ($1, $2, $3, $4, '09:00', '18:00')`,
-      [adminId, nm, "Hodim", defaultFilial]
-    );
+    if (terminalKey) {
+      await pool.query(
+        `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end, access_card_no)
+         VALUES ($1, $2, $3, $4, '09:00', '18:00', $5)`,
+        [adminId, nm, "Hodim", defaultFilial, terminalKey]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end)
+         VALUES ($1, $2, $3, $4, '09:00', '18:00')`,
+        [adminId, nm, "Hodim", defaultFilial]
+      );
+    }
     created += 1;
   }
 
@@ -190,7 +268,8 @@ async function getTerminalEventTimezoneOffsetHours(pool) {
 /**
  * Hodim-nazorati kabi: birinchi kirish/chiqishda hodisadan kelgan ism (va karta raqami) Hodimlar ro‘yxatiga
  * yoziladi yoki yangilanadi, keyin davomat shu yozuvga bog‘lanadi.
- * Qidiruv: avvalo access_card_no, keyin normalizatsiyalangan ism; yo‘q bo‘lsa INSERT.
+ * Qidiruv: avvalo access_card_no, keyin ism. Mavjud hodim nomi turli terminaldagi boshqacha
+ * variantdan faqat avto-yaratilgan "Hodim {id}" / bo‘sh bo‘lsa yangilanadi — aks holda qo‘lda saqlanadi.
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
 export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
@@ -222,44 +301,53 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     return { ok: false, reason: "terminal_admin_yoq" };
   }
 
+  const eventFilial = await resolveEmployeeFilialForTerminal(pool, terminalRow);
+
   let empR = { rows: [] };
 
-  // Terminallar orasida employeeNo/cardNo turlicha bo'lishi mumkin.
-  // Shu sabab avval ism bo'yicha bog'laymiz, keyin key bo'yicha fallback qilamiz.
-  if (nameFromEvent) {
+  // Avval karta/terminal ID bo'yicha (aniqroq), keyin ism bo'yicha — bir xil ismli bir nechta
+  // hodim yoki LIMIT 1 tasodifiy qator tanlashining oldini oladi. Turli terminallarda bir
+  // odamning cardNo farq qilsa, ism mos kelganda baribir bir yozuvga bog'lanadi.
+  if (empKey) {
     empR = await pool.query(
-      `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
-       FROM employees e
-       WHERE ${employeeMatchByNormalizedNameSql}
-       LIMIT 1`,
-      [adminId, nameFromEvent]
-    );
-  }
-
-  if (empR.rows.length === 0 && empKey) {
-    empR = await pool.query(
-      `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
+      `SELECT id, admin_id, name, shift_start, shift_end, weekly_schedule
        FROM employees e
        WHERE ${employeeMatchByAccessCardSql}
+       ORDER BY e.id ASC
        LIMIT 1`,
       [adminId, empKey]
     );
   }
 
+  if (empR.rows.length === 0 && nameFromEvent) {
+    empR = await pool.query(
+      `SELECT id, admin_id, name, shift_start, shift_end, weekly_schedule
+       FROM employees e
+       WHERE ${employeeMatchByNormalizedNameSql}
+       ORDER BY e.id ASC
+       LIMIT 1`,
+      [adminId, nameFromEvent]
+    );
+  }
+
   if (empR.rows.length === 0) {
-    const defaultFilial = await getDefaultFilialForAdmin(pool, adminId);
+    const defaultFilial = eventFilial;
     const newName = nameFromEvent || `Hodim ${String(empKey).trim()}`;
     const cardVal = empKey ? String(empKey).trim() : null;
     empR = await pool.query(
       `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end, access_card_no)
        VALUES ($1, $2, 'Hodim', $3, '09:00', '18:00', $4)
-       RETURNING id, admin_id, shift_start, shift_end, weekly_schedule`,
+       RETURNING id, admin_id, name, shift_start, shift_end, weekly_schedule`,
       [adminId, newName, defaultFilial, cardVal]
     );
   } else {
     const row = empR.rows[0];
+    const prevName = normalizeEmployeeEventName(row.name);
     if (nameFromEvent) {
-      await pool.query(`UPDATE employees SET name = $1 WHERE id = $2`, [nameFromEvent, row.id]);
+      const next = normalizeEmployeeEventName(nameFromEvent);
+      if (next !== prevName && isPlaceholderOrAutoHodimName(prevName, empKey)) {
+        await pool.query(`UPDATE employees SET name = $1 WHERE id = $2`, [nameFromEvent, row.id]);
+      }
     }
     if (empKey) {
       await pool.query(
@@ -299,10 +387,12 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
          check_out_snapshot = CASE
            WHEN $3::text IS NOT NULL AND BTRIM($3::text) <> '' THEN $3
            ELSE check_out_snapshot
-         END
+         END,
+         check_out_filial = $4
        WHERE id = $2
-       RETURNING id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot`,
-      [dt.time, openR.rows[0].id, snap || null]
+       RETURNING id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot,
+         check_in_filial, check_out_filial`,
+      [dt.time, openR.rows[0].id, snap || null, eventFilial]
     );
     if (rows[0] && broadcast && adminId != null) {
       broadcast({ adminId, records: [rowToAttendanceRow(rows[0])] });
@@ -328,10 +418,11 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const lateFlag = computeCheckInLateFlag(emp, dt.date, dt.time, grace);
 
   const { rows } = await pool.query(
-    `INSERT INTO employee_attendance (admin_id, employee_id, record_date, check_in, check_out, late, check_in_snapshot)
-     VALUES ($1, $2, $3::date, $4, NULL, $5, $6)
-     RETURNING id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot`,
-    [adminId, eid, dt.date, dt.time, lateFlag, snap || null]
+    `INSERT INTO employee_attendance (admin_id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_in_filial)
+     VALUES ($1, $2, $3::date, $4, NULL, $5, $6, $7)
+     RETURNING id, employee_id, record_date, check_in, check_out, late, check_in_snapshot, check_out_snapshot,
+       check_in_filial, check_out_filial`,
+    [adminId, eid, dt.date, dt.time, lateFlag, snap || null, eventFilial]
   );
   if (rows[0] && broadcast && adminId != null) {
     broadcast({ adminId, records: [rowToAttendanceRow(rows[0])] });
@@ -350,7 +441,7 @@ function defaultPollStartTime() {
  */
 export async function pollAllTerminalsOnce(pool, broadcast) {
   const { rows: terminals } = await pool.query(
-    `SELECT id, admin_id, terminal_type, ip_address, login, password FROM terminals ORDER BY id ASC`
+    `SELECT id, admin_id, terminal_type, ip_address, login, password, filial FROM terminals ORDER BY id ASC`
   );
   for (const t of terminals) {
     try {

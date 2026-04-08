@@ -143,6 +143,10 @@ export const api = {
   deleteUser: (id) => request(`/users/${id}`, { method: "DELETE" }),
   getTerminals: () => request("/terminals"),
   createTerminal: (body) => request("/terminals", { method: "POST", body: JSON.stringify(body) }),
+  updateTerminal: (id, body) =>
+    request(`/terminals/${encodeURIComponent(String(id))}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteTerminal: (id) =>
+    request(`/terminals/${encodeURIComponent(String(id))}`, { method: "DELETE" }),
   testTerminalConnection: (id) =>
     request(`/terminals/${encodeURIComponent(String(id))}/test-connection`, { method: "POST", body: "{}" }),
   syncTerminalEmployees: (id) =>

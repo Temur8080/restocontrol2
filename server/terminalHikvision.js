@@ -112,8 +112,10 @@ export async function getWithDigest(baseUrl, path, username, password, timeoutMs
 
 const USER_RECORD_PATH = "/ISAPI/AccessControl/UserInfo/Record?format=json";
 const USER_SEARCH_PAGE_SIZE = 300;
-const USER_SEARCH_MAX_PAGES = 80;
-const USER_RECORD_ENRICH_MAX = 100;
+/** Hikvision UserInfo/Search sahifalari; ko‘p hodimda eski yozuvlar sinxron tanlanmasin. */
+const USER_SEARCH_MAX_PAGES = Math.max(1, Number(process.env.HIKVISION_USER_SEARCH_MAX_PAGES || 500));
+/** Ismsiz qatorlar uchun Record API chaqruvi limiti. */
+const USER_RECORD_ENRICH_MAX = Math.max(0, Number(process.env.HIKVISION_USER_RECORD_ENRICH_MAX || 2000));
 
 function numOfMatchesFromSearch(json) {
   const u = json?.UserInfoSearch;
