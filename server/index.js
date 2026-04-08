@@ -1914,6 +1914,10 @@ if (fs.existsSync(distIndexPath)) {
     if (req.path.startsWith("/api")) return next();
     res.sendFile(distIndexPath, (err) => next(err));
   });
+} else {
+  console.warn(
+    "[frontend] dist/index.html yo‘q — loyihada `npm run build` ni ishga tushiring. Hozircha faqat /api va /uploads ishlaydi (sahifalar 404)."
+  );
 }
 
 async function main() {

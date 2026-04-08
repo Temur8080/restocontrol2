@@ -463,7 +463,12 @@ function resolveHikvisionAcSubobject(root) {
   if (raw == null) return root;
   if (typeof raw === "string") {
     const p = tryParseJsonLenient(raw);
-    if (p && typeof p === "object") return p;
+    if (p && typeof p === "object") {
+      // Ba'zi qurilmalarda field ichidagi string yana wrapper obyekt bo'ladi.
+      // Shu holatda ichki AccessControl(ler) obyektigacha tushamiz.
+      const nested = resolveHikvisionAcSubobject(p);
+      return nested && typeof nested === "object" ? nested : p;
+    }
     return root;
   }
   if (typeof raw === "object") return raw;
@@ -513,8 +518,8 @@ function appendEventsFromHikvisionJson(j, out) {
     employeeNo: ac.employeeNo,
     cardNo: ac.cardNo,
     time: ac.time ?? ac.dateTime ?? root?.dateTime,
-    major: ac.major ?? root?.major,
-    minor: ac.minor ?? root?.minor,
+    major: ac.major ?? ac.majorEventType ?? root?.major ?? root?.majorEventType,
+    minor: ac.minor ?? ac.subEventType ?? root?.minor ?? root?.subEventType,
   };
   const displayName = personNameFromAccessControl(ac);
   if (displayName) ev.name = displayName;

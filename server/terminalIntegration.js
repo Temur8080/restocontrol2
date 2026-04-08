@@ -224,23 +224,25 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
 
   let empR = { rows: [] };
 
-  if (empKey) {
-    empR = await pool.query(
-      `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
-       FROM employees e
-       WHERE ${employeeMatchByAccessCardSql}
-       LIMIT 1`,
-      [adminId, empKey]
-    );
-  }
-
-  if (empR.rows.length === 0 && nameFromEvent) {
+  // Terminallar orasida employeeNo/cardNo turlicha bo'lishi mumkin.
+  // Shu sabab avval ism bo'yicha bog'laymiz, keyin key bo'yicha fallback qilamiz.
+  if (nameFromEvent) {
     empR = await pool.query(
       `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
        FROM employees e
        WHERE ${employeeMatchByNormalizedNameSql}
        LIMIT 1`,
       [adminId, nameFromEvent]
+    );
+  }
+
+  if (empR.rows.length === 0 && empKey) {
+    empR = await pool.query(
+      `SELECT id, admin_id, shift_start, shift_end, weekly_schedule
+       FROM employees e
+       WHERE ${employeeMatchByAccessCardSql}
+       LIMIT 1`,
+      [adminId, empKey]
     );
   }
 
