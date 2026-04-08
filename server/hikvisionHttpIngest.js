@@ -8,10 +8,13 @@ import { getWebhookClientIp, normalizeDeviceHost } from "./webhookGuards.js";
 
 /** Hikvision «HTTP monitoring» yurak urishi — tahlil qilmay tez 200 OK. */
 function bufferLooksLikeHeartbeat(buf) {
-  const n = Math.min(buf.length, 16384);
+  const n = Math.min(buf.length, 65536);
   if (n === 0) return false;
   const s = buf.subarray(0, n).toString("utf8");
   if (!/heartBeat|heartbeat/i.test(s)) return false;
+  if (/["']eventType["']\s*:\s*["']heartBeat["']/i.test(s)) return true;
+  if (/eventType"\s*:\s*"heartBeat"/i.test(s)) return true;
+  if (/["']eventDescription["']\s*:\s*["']heartBeat["']/i.test(s)) return true;
   if (/["']heartBeat["']\s*:\s*true/i.test(s)) return true;
   if (/heartBeat\s*[=:]\s*true/i.test(s)) return true;
   if (/"active"\s*:\s*1/i.test(s) && /heartbeat/i.test(s)) return true;
@@ -472,6 +475,10 @@ function appendEventsFromHikvisionJson(j, out) {
   const root = Array.isArray(j) ? j[0] : j;
   if (!root || typeof root !== "object") return;
 
+  const rootEt = String(root.eventType ?? root.EventType ?? "").trim();
+  const rootDesc = String(root.eventDescription ?? root.EventDescription ?? "").trim();
+  if (/heartBeat/i.test(rootEt) || /heartBeat/i.test(rootDesc)) return;
+
   const dip =
     root.ipAddress ||
     root.deviceIP ||
@@ -485,6 +492,10 @@ function appendEventsFromHikvisionJson(j, out) {
 
   const ac = resolveHikvisionAcSubobject(root);
   if (!ac || typeof ac !== "object") return;
+
+  const acEt = String(ac.eventType ?? ac.EventType ?? "").trim();
+  const acDesc = String(ac.eventDescription ?? ac.EventDescription ?? "").trim();
+  if (/heartBeat/i.test(acEt) || /heartBeat/i.test(acDesc)) return;
 
   const picRaw =
     ac.picture ?? ac.Picture ?? ac.SNAPPicture ?? ac.snapPicture ?? ac.faceSnap ?? ac.pictureData;
@@ -533,6 +544,14 @@ function appendEventsFromHikvisionJson(j, out) {
     } else if (pathNorm.startsWith("/") || /LOCALS/i.test(pathNorm)) {
       ev.pictureURL = cleanTerminalImagePath(pathNorm);
     }
+  }
+
+  const hasPersonId =
+    String(ev.employeeNoString ?? ev.employeeNo ?? ev.cardNo ?? "").trim() !== "";
+  const hasName = String(ev.name ?? "").trim() !== "";
+  if (!hasPersonId && !hasName && !picNorm) {
+    /* Qurilma/controller JSON (faqat serialNo va h.k.) — XML yo‘lidagi kabi davomatga yuborilmaydi */
+    return;
   }
   out.events.push(ev);
 }
