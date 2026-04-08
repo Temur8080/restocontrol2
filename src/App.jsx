@@ -3877,25 +3877,24 @@ function App() {
     if (userRole !== "admin" && userRole !== "superadmin") return;
     setTerminalSyncBusy(true);
     try {
-      const r = await api.generateEmployeesFromTerminals();
       const d = await api.bootstrap();
+      const employeesFromDb = Array.isArray(d?.employees) ? d.employees.map(migrateEmployeeSchedule) : [];
       if (d?.employees) {
-        setEmployees(Array.isArray(d.employees) ? d.employees.map(migrateEmployeeSchedule) : []);
+        setEmployees(employeesFromDb);
       }
       if (d?.attendanceRecords) {
         setAttendanceRecords(Array.isArray(d.attendanceRecords) ? d.attendanceRecords : []);
       }
+      const dbLoadMessage =
+        locale === "ru"
+          ? `Список сотрудников обновлен из базы данных. Загружено: ${employeesFromDb.length}.`
+          : locale === "en"
+            ? `Employee list refreshed from the database. Loaded: ${employeesFromDb.length}.`
+            : `Hodimlar ro'yxati bazadan yangilandi. Yuklangan: ${employeesFromDb.length}.`;
       setTerminalSyncResultModal({
         open: true,
         isError: false,
-        message: t("employees.terminalSyncSummary", {
-          created: r.created ?? 0,
-          updated: r.updated ?? 0,
-          terminals: r.terminalCount ?? 0,
-          scanned: r.scannedTotal ?? 0,
-          pages: r.pagesTotal ?? 0,
-          enriched: r.enrichedTotal ?? 0,
-        }),
+        message: dbLoadMessage,
       });
     } catch (err) {
       setTerminalSyncResultModal({
