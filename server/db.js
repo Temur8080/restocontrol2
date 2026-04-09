@@ -197,6 +197,35 @@ export async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_terminal_event_dedupe_created ON terminal_event_dedupe (created_at);
   `);
 
+  // admin + filial kesimida bir xil normalizatsiyalangan ism takrorlanmasin.
+  // Oldindan dublikatlar bo'lsa migratsiya yiqilmasligi uchun avval tekshiramiz.
+  const dupEmpName = await pool.query(
+    `SELECT
+       admin_id,
+       COALESCE(NULLIF(TRIM(filial), ''), 'Asosiy filial') AS filial_norm,
+       LOWER(TRIM(REGEXP_REPLACE(TRIM(COALESCE(name, '')), E'\\s+', ' ', 'g'))) AS name_norm,
+       COUNT(*)::int AS cnt
+     FROM employees
+     GROUP BY admin_id, COALESCE(NULLIF(TRIM(filial), ''), 'Asosiy filial'),
+              LOWER(TRIM(REGEXP_REPLACE(TRIM(COALESCE(name, '')), E'\\s+', ' ', 'g')))
+     HAVING COUNT(*) > 1
+     LIMIT 1`
+  );
+  if (dupEmpName.rows.length === 0) {
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS uq_employees_admin_filial_normname
+       ON employees (
+         admin_id,
+         COALESCE(NULLIF(TRIM(filial), ''), 'Asosiy filial'),
+         LOWER(TRIM(REGEXP_REPLACE(TRIM(COALESCE(name, '')), E'\\s+', ' ', 'g')))
+       )`
+    );
+  } else {
+    console.warn(
+      "[db] uq_employees_admin_filial_normname yaratilmadi: employees jadvalida admin+filial bo'yicha bir xil ism dublikatlari bor"
+    );
+  }
+
   const pkInfo = await pool.query(
     `SELECT array_agg(a.attname ORDER BY ord.n) AS cols
      FROM pg_constraint c

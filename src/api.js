@@ -152,6 +152,12 @@ export const api = {
   syncTerminalEmployees: (id) =>
     request(`/terminals/${encodeURIComponent(String(id))}/sync-employees`, { method: "POST", body: "{}" }),
   syncAllTerminalsEmployees: () => request("/terminals/sync-all-my-employees", { method: "POST", body: "{}" }),
+  getDuplicateEmployees: () => request("/employees/duplicates"),
+  mergeDuplicateEmployees: (keepEmployeeId, removeEmployeeId) =>
+    request("/employees/merge-duplicates", {
+      method: "POST",
+      body: JSON.stringify({ keepEmployeeId, removeEmployeeId }),
+    }),
   generateEmployeesFromTerminals: () =>
     request("/employees/generate-from-terminals", { method: "POST", body: "{}" }),
   setUserSubscription: (id, endAt, amount, text) =>

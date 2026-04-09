@@ -298,23 +298,37 @@ export async function fetchHikvisionEvents(
   endTime,
   timeoutMs = DEFAULT_TIMEOUT_MS
 ) {
-  const payload = {
-    AcsEventCond: {
-      searchID: `sync-${Date.now()}`,
-      searchResultPosition: 0,
-      maxResults: 200,
-      major: 0,
-      minor: 0,
-      startTime: startTime || "2020-01-01T00:00:00+05:00",
-      endTime: endTime || "2035-12-31T23:59:59+05:00",
-    },
-  };
-  const res = await postJsonDigest(baseUrl, ACS_EVENT_PATH, login, password, payload, timeoutMs);
-  if (!res.httpOk || res.status !== 200 || !res.json?.AcsEvent) {
-    return { ok: false, events: [], error: res.networkError || res.textPreview || `HTTP ${res.status}` };
+  const all = [];
+  const searchID = `sync-${Date.now()}`;
+  let position = 0;
+  // API'ning bir javobdagi sahifa hajmi; app tomonda hodisalar kesilmaydi, barcha sahifalar olinadi.
+  const pageSize = 200;
+
+  for (;;) {
+    const payload = {
+      AcsEventCond: {
+        searchID,
+        searchResultPosition: position,
+        maxResults: pageSize,
+        major: 0,
+        minor: 0,
+        startTime: startTime || "2020-01-01T00:00:00+05:00",
+        endTime: endTime || "2035-12-31T23:59:59+05:00",
+      },
+    };
+    const res = await postJsonDigest(baseUrl, ACS_EVENT_PATH, login, password, payload, timeoutMs);
+    if (!res.httpOk || res.status !== 200 || !res.json?.AcsEvent) {
+      if (all.length > 0) break;
+      return { ok: false, events: [], error: res.networkError || res.textPreview || `HTTP ${res.status}` };
+    }
+    const raw = asArray(res.json.AcsEvent.InfoList);
+    if (raw.length === 0) break;
+    all.push(...raw);
+    position += raw.length;
+    if (raw.length < pageSize) break;
   }
-  const raw = asArray(res.json.AcsEvent.InfoList);
-  return { ok: true, events: raw, error: null };
+
+  return { ok: true, events: all, error: null };
 }
 
 export function eventEmployeeKey(ev) {

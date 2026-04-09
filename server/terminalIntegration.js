@@ -12,7 +12,10 @@ import {
 } from "./terminalHikvision.js";
 import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.js";
 import { resolveSnapshotForTerminalEvent } from "./attendanceFaceImages.js";
-import { employeeMatchByNormalizedNameSql, employeeMatchByAccessCardSql } from "./employeeAccessCards.js";
+import {
+  employeeMatchByNormalizedNameAndFilialSql,
+  employeeMatchByAccessCardSql,
+} from "./employeeAccessCards.js";
 import { isCheckoutTerminalType, isExitLikeAccessEvent } from "./hikvisionAccessDirection.js";
 import { isPrivateLanHostname } from "./terminalProbe.js";
 
@@ -190,10 +193,14 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     const byName = await pool.query(
       `SELECT id, name, access_card_no FROM employees
        WHERE admin_id = $1
+         AND (
+           COALESCE(NULLIF(TRIM(filial), ''), 'Asosiy filial') = COALESCE(NULLIF(TRIM($3::text), ''), 'Asosiy filial')
+           OR COALESCE(NULLIF(TRIM(filial), ''), 'Asosiy filial') = '*'
+         )
          AND LOWER(TRIM(REGEXP_REPLACE(TRIM(COALESCE(name, '')), E'\\\\s+', ' ', 'g'))) = LOWER($2::text)
        ORDER BY id ASC
        LIMIT 1`,
-      [adminId, nm]
+      [adminId, nm, defaultFilial]
     );
     if (byName.rows.length > 0) {
       const row = byName.rows[0];
@@ -283,7 +290,12 @@ async function getTerminalEventTimezoneOffsetHours(pool) {
  * @returns {Promise<{ ok: boolean, reason?: string }>}
  */
 export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
-  const nameFromEvent = normalizeEmployeeEventName(eventEmployeeName(ev));
+  const isCheckoutSource = isCheckoutTerminalType(terminalRow?.terminal_type);
+  // Bir admin/filialda nom manbasi sifatida kirish terminalini ustun qilamiz.
+  // Chiqish terminalidan kelgan hodisalar attendance uchun ishlaydi, lekin ismni
+  // yaratish/yangilashda ishlatilmaydi (xodimlar aralashib ketishini kamaytiradi).
+  const rawNameFromEvent = normalizeEmployeeEventName(eventEmployeeName(ev));
+  const nameFromEvent = isCheckoutSource ? "" : rawNameFromEvent;
   const empKey = eventEmployeeKey(ev);
   const timeIso = eventTimeIso(ev);
 
@@ -333,10 +345,10 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     empR = await pool.query(
       `SELECT id, admin_id, name, shift_start, shift_end, weekly_schedule
        FROM employees e
-       WHERE ${employeeMatchByNormalizedNameSql}
+       WHERE ${employeeMatchByNormalizedNameAndFilialSql}
        ORDER BY e.id ASC
        LIMIT 1`,
-      [adminId, nameFromEvent]
+      [adminId, nameFromEvent, eventFilial]
     );
   }
 
@@ -372,7 +384,7 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const emp = empR.rows[0];
   const eid = Number(emp.id);
 
-  const chiqishQurilma = isCheckoutTerminalType(terminalRow.terminal_type);
+  const chiqishQurilma = isCheckoutSource;
   // Chiqish deb belgilangan terminal: minor va boshqa maydonlardan qat'iy nazar chiqish.
   // Kirish terminalda HTTP / noto'g'ri tanlash uchun hodisadan chiqish izi bo'lsa ham checkout.
   const checkout = chiqishQurilma || (!chiqishQurilma && isExitLikeAccessEvent(ev));

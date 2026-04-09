@@ -184,6 +184,38 @@ function rowToSalaryAdjustment(row) {
   };
 }
 
+function normalizeTerminalIpForUniq(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  try {
+    const withProto = /^https?:\/\//i.test(s) ? s : `http://${s}`;
+    const u = new URL(withProto);
+    return String(u.hostname || "")
+      .toLowerCase()
+      .replace(/^::ffff:/i, "")
+      .trim();
+  } catch {
+    return s.toLowerCase().replace(/^::ffff:/i, "").trim();
+  }
+}
+
+async function findTerminalIpConflict(pool, rawIp, excludeTerminalId = null) {
+  const target = normalizeTerminalIpForUniq(rawIp);
+  if (!target) return null;
+  const { rows } = await pool.query(`SELECT id, admin_id, ip_address FROM terminals ORDER BY id ASC`);
+  for (const row of rows) {
+    const rowId = Number(row.id);
+    if (excludeTerminalId != null && Number.isFinite(Number(excludeTerminalId)) && rowId === Number(excludeTerminalId)) {
+      continue;
+    }
+    const other = normalizeTerminalIpForUniq(row.ip_address);
+    if (other && other === target) {
+      return row;
+    }
+  }
+  return null;
+}
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
@@ -269,6 +301,20 @@ async function requireActiveAdminOrSuperadmin(req, res) {
 }
 
 async function runSyncEmployeesAcrossTerminals(terminalRows) {
+  // Bir admin+filial kesimida hodimlar ro'yxatini bitta terminaldan (Kirish) olish:
+  // agar Kirish bo'lsa Chiqish terminal(lar) sync qilinmaydi.
+  const preferred = [];
+  const grouped = new Map();
+  for (const t of terminalRows) {
+    const key = `${Number(t.admin_id) || 0}|${String(t.filial || "").trim().toLowerCase()}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(t);
+  }
+  for (const arr of grouped.values()) {
+    const kirish = arr.find((t) => String(t.terminal_type || "").trim().toLowerCase() !== "chiqish");
+    preferred.push(kirish || arr[0]);
+  }
+
   let created = 0;
   let updated = 0;
   let totalUsers = 0;
@@ -276,7 +322,7 @@ async function runSyncEmployeesAcrossTerminals(terminalRows) {
   let pagesTotal = 0;
   let enrichedTotal = 0;
   const details = [];
-  for (const t of terminalRows) {
+  for (const t of preferred) {
     const r = await syncEmployeesFromTerminal(pool, t);
     details.push({
       terminalId: t.id,
@@ -294,7 +340,7 @@ async function runSyncEmployeesAcrossTerminals(terminalRows) {
   }
   return {
     ok: true,
-    terminalCount: terminalRows.length,
+    terminalCount: preferred.length,
     created,
     updated,
     totalDeviceUsers: totalUsers,
@@ -303,6 +349,42 @@ async function runSyncEmployeesAcrossTerminals(terminalRows) {
     enrichedTotal,
     details,
   };
+}
+
+async function findDuplicateEmployeeNamesByAdmin(adminId) {
+  const { rows } = await pool.query(
+    `WITH norm AS (
+       SELECT
+         e.id,
+         e.admin_id,
+         e.name,
+         COALESCE(NULLIF(TRIM(e.filial), ''), 'Asosiy filial') AS filial_norm,
+         COALESCE(NULLIF(TRIM(e.access_card_no), ''), '') AS access_card_no,
+         LOWER(TRIM(REGEXP_REPLACE(TRIM(COALESCE(e.name, '')), E'\\s+', ' ', 'g'))) AS name_norm
+       FROM employees e
+       WHERE e.admin_id = $1
+     )
+     SELECT
+       name_norm,
+       json_agg(
+         json_build_object(
+           'id', id,
+           'name', name,
+           'filial', filial_norm,
+           'accessCardNo', access_card_no
+         ) ORDER BY id ASC
+       ) AS rows
+     FROM norm
+     WHERE name_norm <> ''
+     GROUP BY name_norm
+     HAVING COUNT(*) > 1
+     ORDER BY name_norm ASC`,
+    [adminId]
+  );
+  return rows.map((r) => ({
+    nameNorm: r.name_norm,
+    rows: Array.isArray(r.rows) ? r.rows : [],
+  }));
 }
 
 const DB_TABLE_CONFIG = {
@@ -1115,6 +1197,12 @@ api.post("/terminals", async (req, res) => {
     if (!terminalName || !Number.isFinite(adminId) || !ipAddress || !login || !password) {
       return res.status(400).json({ error: "Barcha maydonlar majburiy" });
     }
+    const ipConflict = await findTerminalIpConflict(pool, ipAddress);
+    if (ipConflict) {
+      return res.status(409).json({
+        error: `Bu IP allaqachon boshqa terminalga biriktirilgan (terminal_id=${ipConflict.id}, admin_id=${ipConflict.admin_id})`,
+      });
+    }
     const adminR = await pool.query(`SELECT id FROM users WHERE id = $1 AND role = 'admin'`, [adminId]);
     if (adminR.rows.length === 0) return res.status(400).json({ error: "Admin topilmadi" });
     const filialVal = await resolveTerminalFilialForSave(pool, adminId, filialRaw);
@@ -1147,6 +1235,12 @@ api.patch("/terminals/:id", async (req, res) => {
     const terminalType = terminalTypeIn === "Chiqish" ? "Chiqish" : "Kirish";
     if (!terminalName || !Number.isFinite(adminId) || !ipAddress || !login || !password) {
       return res.status(400).json({ error: "Barcha maydonlar majburiy" });
+    }
+    const ipConflict = await findTerminalIpConflict(pool, ipAddress, id);
+    if (ipConflict) {
+      return res.status(409).json({
+        error: `Bu IP allaqachon boshqa terminalga biriktirilgan (terminal_id=${ipConflict.id}, admin_id=${ipConflict.admin_id})`,
+      });
     }
     const adminR = await pool.query(`SELECT id FROM users WHERE id = $1 AND role = 'admin'`, [adminId]);
     if (adminR.rows.length === 0) return res.status(400).json({ error: "Admin topilmadi" });
@@ -1244,6 +1338,7 @@ api.post("/terminals/sync-all-my-employees", async (req, res) => {
       [adminId]
     );
     const result = await runSyncEmployeesAcrossTerminals(rows);
+    result.duplicateGroups = await findDuplicateEmployeeNamesByAdmin(adminId);
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -1270,10 +1365,95 @@ api.post("/employees/generate-from-terminals", async (req, res) => {
       rows = r.rows;
     }
     const result = await runSyncEmployeesAcrossTerminals(rows);
+    if (req.auth?.role === "admin") {
+      result.duplicateGroups = await findDuplicateEmployeeNamesByAdmin(req.auth.sub);
+    }
     res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+api.get("/employees/duplicates", async (req, res) => {
+  try {
+    const ok = await requireActiveAdminOrSuperadmin(req, res);
+    if (!ok) return;
+    if (req.auth?.role !== "admin") {
+      return res.status(403).json({ error: "Faqat admin" });
+    }
+    const groups = await findDuplicateEmployeeNamesByAdmin(req.auth.sub);
+    res.json({ groups });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+api.post("/employees/merge-duplicates", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ok = await requireActiveAdminOrSuperadmin(req, res);
+    if (!ok) {
+      client.release();
+      return;
+    }
+    if (req.auth?.role !== "admin") {
+      return res.status(403).json({ error: "Faqat admin" });
+    }
+    const keepEmployeeId = Number.parseInt(String(req.body?.keepEmployeeId ?? ""), 10);
+    const removeEmployeeId = Number.parseInt(String(req.body?.removeEmployeeId ?? ""), 10);
+    if (!Number.isFinite(keepEmployeeId) || !Number.isFinite(removeEmployeeId) || keepEmployeeId === removeEmployeeId) {
+      return res.status(400).json({ error: "Noto'g'ri employee id" });
+    }
+    const adminId = Number(req.auth.sub);
+    const pair = await client.query(
+      `SELECT id, admin_id, name, filial, access_card_no FROM employees
+       WHERE id IN ($1, $2) AND admin_id = $3
+       ORDER BY id ASC`,
+      [keepEmployeeId, removeEmployeeId, adminId]
+    );
+    if (pair.rows.length !== 2) {
+      return res.status(404).json({ error: "Hodim topilmadi yoki sizga tegishli emas" });
+    }
+    const keep = pair.rows.find((r) => Number(r.id) === keepEmployeeId);
+    const rem = pair.rows.find((r) => Number(r.id) === removeEmployeeId);
+    if (!keep || !rem) {
+      return res.status(404).json({ error: "Hodim topilmadi" });
+    }
+
+    await client.query("BEGIN");
+    await client.query(`UPDATE employee_attendance SET employee_id = $1 WHERE employee_id = $2`, [keepEmployeeId, removeEmployeeId]);
+    await client.query(
+      `INSERT INTO employee_salary_overrides (admin_id, employee_id, amount, salary_type)
+       SELECT admin_id, $1, amount, salary_type
+       FROM employee_salary_overrides WHERE employee_id = $2
+       ON CONFLICT (employee_id) DO NOTHING`,
+      [keepEmployeeId, removeEmployeeId]
+    );
+    await client.query(`UPDATE employee_salary_payments SET employee_id = $1 WHERE employee_id = $2`, [keepEmployeeId, removeEmployeeId]);
+    await client.query(`UPDATE employee_salary_adjustments SET employee_id = $1 WHERE employee_id = $2`, [keepEmployeeId, removeEmployeeId]);
+    await client.query(`UPDATE users SET employee_id = $1 WHERE employee_id = $2`, [keepEmployeeId, removeEmployeeId]);
+
+    const keepCard = String(keep.access_card_no || "").trim();
+    const remCard = String(rem.access_card_no || "").trim();
+    const mergedCard = keepCard || remCard || null;
+    await client.query(`UPDATE employees SET access_card_no = $2, filial = '*' WHERE id = $1`, [keepEmployeeId, mergedCard]);
+    await client.query(`DELETE FROM employees WHERE id = $1`, [removeEmployeeId]);
+    await client.query("COMMIT");
+
+    const groups = await findDuplicateEmployeeNamesByAdmin(adminId);
+    res.json({ ok: true, keepEmployeeId, removedEmployeeId: removeEmployeeId, duplicateGroups: groups });
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  } finally {
+    client.release();
   }
 });
 

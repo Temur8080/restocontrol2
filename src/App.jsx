@@ -1211,7 +1211,9 @@ function App() {
     open: false,
     message: "",
     isError: false,
+    duplicateGroups: [],
   });
+  const [terminalMergeBusyKey, setTerminalMergeBusyKey] = useState("");
 
   const [userCreateModalOpen, setUserCreateModalOpen] = useState(false);
   const [userCreateBusy, setUserCreateBusy] = useState(false);
@@ -4001,13 +4003,15 @@ function App() {
   }
 
   function closeTerminalSyncResultModal() {
-    setTerminalSyncResultModal({ open: false, message: "", isError: false });
+    setTerminalSyncResultModal({ open: false, message: "", isError: false, duplicateGroups: [] });
+    setTerminalMergeBusyKey("");
   }
 
   async function pullEmployeesFromTerminals() {
     if (userRole !== "admin" && userRole !== "superadmin") return;
     setTerminalSyncBusy(true);
     try {
+      const syncRes = await api.syncAllTerminalsEmployees();
       const d = await api.bootstrap();
       const employeesFromDb = Array.isArray(d?.employees) ? d.employees.map(migrateEmployeeSchedule) : [];
       if (d?.employees) {
@@ -4019,22 +4023,26 @@ function App() {
       // DB'dan qayta yuklaganda ro'yxat yashirinib qolmasligi uchun filtrlarni tiklaymiz.
       setFilialFilter("all");
       setCardFilter("all");
-      const dbLoadMessage =
-        locale === "ru"
-          ? `Список сотрудников обновлен из базы данных. Загружено: ${employeesFromDb.length}.`
-          : locale === "en"
-            ? `Employee list refreshed from the database. Loaded: ${employeesFromDb.length}.`
-            : `Hodimlar ro'yxati bazadan yangilandi. Yuklangan: ${employeesFromDb.length}.`;
+      const dbLoadMessage = t("employees.terminalSyncSummary", {
+        terminals: syncRes?.terminalCount ?? 0,
+        created: syncRes?.created ?? 0,
+        updated: syncRes?.updated ?? 0,
+        scanned: syncRes?.scannedTotal ?? 0,
+        pages: syncRes?.pagesTotal ?? 0,
+        enriched: syncRes?.enrichedTotal ?? 0,
+      });
       setTerminalSyncResultModal({
         open: true,
         isError: false,
         message: dbLoadMessage,
+        duplicateGroups: Array.isArray(syncRes?.duplicateGroups) ? syncRes.duplicateGroups : [],
       });
     } catch (err) {
       setTerminalSyncResultModal({
         open: true,
         isError: true,
         message: translateApiError(err instanceof Error ? err.message : String(err), locale),
+        duplicateGroups: [],
       });
     } finally {
       setTerminalSyncBusy(false);
@@ -4061,15 +4069,54 @@ function App() {
           pages: r.pages ?? 0,
           enriched: r.enriched ?? 0,
         }),
+        duplicateGroups: [],
       });
     } catch (err) {
+      let groups = [];
+      try {
+        const dup = await api.getDuplicateEmployees();
+        groups = Array.isArray(dup?.groups) ? dup.groups : [];
+      } catch {
+        groups = [];
+      }
       setTerminalSyncResultModal({
         open: true,
         isError: true,
         message: translateApiError(err instanceof Error ? err.message : String(err), locale),
+        duplicateGroups: groups,
       });
     } finally {
       setTerminalTableSyncBusyId(null);
+    }
+  }
+
+  async function mergeDuplicateEmployees(keepEmployeeId, removeEmployeeId) {
+    const key = `${keepEmployeeId}:${removeEmployeeId}`;
+    setTerminalMergeBusyKey(key);
+    try {
+      const r = await api.mergeDuplicateEmployees(keepEmployeeId, removeEmployeeId);
+      const d = await api.bootstrap();
+      if (d?.employees) {
+        setEmployees(Array.isArray(d.employees) ? d.employees.map(migrateEmployeeSchedule) : []);
+      }
+      setTerminalSyncResultModal((prev) => ({
+        ...prev,
+        isError: false,
+        message: locale === "ru"
+          ? "Дубликаты объединены. Сотрудник теперь может работать через все филиалы."
+          : locale === "en"
+            ? "Duplicates merged. Employee can now work across all branches."
+            : "Dublikatlar birlashtirildi. Hodim endi barcha filiallarda ishlaydi.",
+        duplicateGroups: Array.isArray(r?.duplicateGroups) ? r.duplicateGroups : [],
+      }));
+    } catch (err) {
+      setTerminalSyncResultModal((prev) => ({
+        ...prev,
+        isError: true,
+        message: translateApiError(err instanceof Error ? err.message : String(err), locale),
+      }));
+    } finally {
+      setTerminalMergeBusyKey("");
     }
   }
 
@@ -8006,6 +8053,45 @@ function App() {
               <p className={terminalSyncResultModal.isError ? "login-err" : "terminal-sync-result-msg"}>
                 {terminalSyncResultModal.message}
               </p>
+              {Array.isArray(terminalSyncResultModal.duplicateGroups) &&
+              terminalSyncResultModal.duplicateGroups.length > 0 ? (
+                <div className="terminal-sync-duplicates">
+                  <h4>Dublikat hodimlar (birlashtirish)</h4>
+                  {terminalSyncResultModal.duplicateGroups.map((g, idx) => {
+                    const rows = Array.isArray(g?.rows) ? g.rows : [];
+                    if (rows.length < 2) return null;
+                    const keep = rows[0];
+                    return (
+                      <div key={`${g?.nameNorm || "dup"}-${idx}`} className="terminal-sync-dup-group">
+                        <p className="terminal-sync-dup-title">
+                          Ism: <strong>{keep?.name || g?.nameNorm || "—"}</strong>
+                        </p>
+                        <div className="terminal-sync-dup-list">
+                          {rows.map((r, i) => (
+                            <div key={r.id ?? i} className="terminal-sync-dup-row">
+                              <span>
+                                #{r.id} · {r.name || "—"} · {r.filial || "—"} · {r.accessCardNo || "karta yo'q"}
+                              </span>
+                              {i === 0 ? (
+                                <span className="terminal-sync-dup-keep">Asosiy</span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="modal-btn"
+                                  disabled={terminalMergeBusyKey === `${keep.id}:${r.id}`}
+                                  onClick={() => mergeDuplicateEmployees(keep.id, r.id)}
+                                >
+                                  {terminalMergeBusyKey === `${keep.id}:${r.id}` ? "Birlashtirilmoqda..." : "Asosiyga birlashtirish"}
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
             </div>
             <div className="modal-actions">
               <button type="button" className="modal-btn modal-btn-primary" onClick={closeTerminalSyncResultModal}>
