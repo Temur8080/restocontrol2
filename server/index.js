@@ -301,19 +301,8 @@ async function requireActiveAdminOrSuperadmin(req, res) {
 }
 
 async function runSyncEmployeesAcrossTerminals(terminalRows) {
-  // Bir admin+filial kesimida hodimlar ro'yxatini bitta terminaldan (Kirish) olish:
-  // agar Kirish bo'lsa Chiqish terminal(lar) sync qilinmaydi.
-  const preferred = [];
-  const grouped = new Map();
-  for (const t of terminalRows) {
-    const key = `${Number(t.admin_id) || 0}|${String(t.filial || "").trim().toLowerCase()}`;
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push(t);
-  }
-  for (const arr of grouped.values()) {
-    const kirish = arr.find((t) => String(t.terminal_type || "").trim().toLowerCase() !== "chiqish");
-    preferred.push(kirish || arr[0]);
-  }
+  // Endi kirish/chiqish terminallari bir xil sync qilinadi.
+  const preferred = Array.isArray(terminalRows) ? [...terminalRows] : [];
 
   let created = 0;
   let updated = 0;

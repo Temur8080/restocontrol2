@@ -172,6 +172,12 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
       );
       if (byCard.rows.length > 0) {
         const row = byCard.rows[0];
+        const byCardName = normalizeEmployeeEventName(row.name);
+        const hasRealNameConflict =
+          nm && byCardName && byCardName !== nm && !isPlaceholderOrAutoHodimName(byCardName, terminalKey);
+        if (hasRealNameConflict) {
+          // ID boshqa terminalda qayta ishlatilgan bo'lishi mumkin; by-name/alias oqimiga o'tamiz.
+        } else {
         const prevName = normalizeEmployeeEventName(row.name);
         const prevCard = String(row.access_card_no || "").trim();
         const allowNameFromTerminal = isPlaceholderOrAutoHodimName(prevName, terminalKey);
@@ -188,6 +194,7 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
         }
         await upsertEmployeeTerminalAlias(pool, Number(row.id), Number(terminalRow.id), terminalKey);
         continue;
+        }
       }
     }
 
@@ -220,6 +227,11 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
           row.id,
         ]);
         updated += 1;
+      }
+      if (terminalKey && prevCard && prevCard !== terminalKey) {
+        // Bir admin+filialda bir xil ism uchun turli terminal ID'lar bo'lsa:
+        // employees.access_card_no ni yagona canonical kalitga o'tkazamiz.
+        await promoteEmployeeToCanonicalKey(pool, Number(row.id));
       }
       if (terminalKey) {
         await upsertEmployeeTerminalAlias(pool, Number(row.id), Number(terminalRow.id), terminalKey);
@@ -299,7 +311,7 @@ async function recordDedupeSuccess(pool, terminalId, dedupeKey) {
 async function findEmployeeByTerminalAlias(pool, adminId, terminalId, terminalKey) {
   if (!terminalId || !terminalKey) return null;
   const r = await pool.query(
-    `SELECT e.id, e.admin_id, e.name, e.shift_start, e.shift_end, e.weekly_schedule
+    `SELECT e.id, e.admin_id, e.name, e.access_card_no, e.shift_start, e.shift_end, e.weekly_schedule
      FROM employee_terminal_keys k
      JOIN employees e ON e.id = k.employee_id
      WHERE k.terminal_id = $1
@@ -323,6 +335,16 @@ async function upsertEmployeeTerminalAlias(pool, employeeId, terminalId, termina
   );
 }
 
+function buildCanonicalEmployeeKey(employeeId) {
+  return `ID_A${String(employeeId)}`;
+}
+
+async function promoteEmployeeToCanonicalKey(pool, employeeId) {
+  if (!employeeId) return;
+  const canonical = buildCanonicalEmployeeKey(employeeId);
+  await pool.query(`UPDATE employees SET access_card_no = $2 WHERE id = $1`, [employeeId, canonical]);
+}
+
 async function getTerminalEventTimezoneOffsetHours(pool) {
   const { rows } = await pool.query(`SELECT value FROM app_kv WHERE key = 'terminal_event_timezone_offset_hours' LIMIT 1`);
   const n = Number(rows[0]?.value);
@@ -339,12 +361,9 @@ async function getTerminalEventTimezoneOffsetHours(pool) {
  */
 export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const isCheckoutSource = isCheckoutTerminalType(terminalRow?.terminal_type);
-  // Bir admin/filialda nom manbasi sifatida kirish terminalini ustun qilamiz.
-  // Chiqish terminalidan kelgan hodisalar attendance uchun ishlaydi, lekin ismni
-  // yaratish/yangilashda ishlatilmaydi (xodimlar aralashib ketishini kamaytiradi).
-  // Qidiruv uchun hodisadagi ism har doim ishlatiladi; chiqishda yangi yozuv faqat karta/ID bilan.
   const rawNameFromEvent = normalizeEmployeeEventName(eventEmployeeName(ev));
-  const nameForCreateUpdate = isCheckoutSource ? "" : rawNameFromEvent;
+  // Kirish/chiqish terminallari bir xil ishlaydi: ism bo'lsa create/update va match uchun ishlatiladi.
+  const nameForCreateUpdate = rawNameFromEvent;
   const empKey = eventEmployeeKey(ev);
   const timeIso = eventTimeIso(ev);
 
@@ -382,13 +401,25 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   // odamning cardNo farq qilsa, ism mos kelganda baribir bir yozuvga bog'lanadi.
   if (empKey) {
     empR = await pool.query(
-      `SELECT id, admin_id, name, shift_start, shift_end, weekly_schedule
+      `SELECT id, admin_id, name, access_card_no, shift_start, shift_end, weekly_schedule
        FROM employees e
        WHERE ${employeeMatchByAccessCardAndFilialSql}
        ORDER BY e.id ASC
        LIMIT 1`,
       [adminId, empKey, eventFilial]
     );
+    if (empR.rows.length > 0 && rawNameFromEvent) {
+      const byCardName = normalizeEmployeeEventName(empR.rows[0].name);
+      // Turli terminallarda ID qayta ishlatilsa (masalan T1:5=Temur, T2:5=Zuhra),
+      // noto'g'ri employeega yopishib ketmasligi uchun by-card nomini tekshiramiz.
+      if (
+        byCardName &&
+        byCardName !== rawNameFromEvent &&
+        !isPlaceholderOrAutoHodimName(byCardName, empKey)
+      ) {
+        empR = { rows: [] };
+      }
+    }
     if (empR.rows.length === 0) {
       const byAlias = await findEmployeeByTerminalAlias(pool, adminId, Number(terminalRow.id), empKey);
       if (byAlias) empR = { rows: [byAlias] };
@@ -397,7 +428,7 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
 
   if (empR.rows.length === 0 && rawNameFromEvent) {
     empR = await pool.query(
-      `SELECT id, admin_id, name, shift_start, shift_end, weekly_schedule
+      `SELECT id, admin_id, name, access_card_no, shift_start, shift_end, weekly_schedule
        FROM employees e
        WHERE ${employeeMatchByNormalizedNameAndFilialSql}
        ORDER BY e.id ASC
@@ -407,13 +438,6 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   }
 
   if (empR.rows.length === 0) {
-    if (!empKey && isCheckoutSource) {
-      return {
-        ok: false,
-        reason:
-          "chiqish_terminali: bazada hodim topilmadi — avval kirish terminalida ro‘yxatga oling yoki karta/ID bilan qo‘shing (chiqishdan faqat ism bilan yangi hodim yaratilmaydi)",
-      };
-    }
     const defaultFilial = eventFilial;
     const keyTrim = empKey ? String(empKey).trim() : "";
     const newName = keyTrim
@@ -426,12 +450,13 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     empR = await pool.query(
       `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end, access_card_no)
        VALUES ($1, $2, 'Hodim', $3, '09:00', '18:00', $4)
-       RETURNING id, admin_id, name, shift_start, shift_end, weekly_schedule`,
+       RETURNING id, admin_id, name, access_card_no, shift_start, shift_end, weekly_schedule`,
       [adminId, newName, defaultFilial, cardVal]
     );
   } else {
     const row = empR.rows[0];
     const prevName = normalizeEmployeeEventName(row.name);
+    const prevCard = String(row.access_card_no || "").trim();
     if (nameForCreateUpdate) {
       const next = normalizeEmployeeEventName(nameForCreateUpdate);
       if (next !== prevName && isPlaceholderOrAutoHodimName(prevName, empKey)) {
@@ -445,6 +470,9 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
            AND (access_card_no IS NULL OR BTRIM(COALESCE(access_card_no::text, '')) = '')`,
         [row.id, String(empKey).trim()]
       );
+    }
+    if (empKey && prevCard && prevCard !== String(empKey).trim()) {
+      await promoteEmployeeToCanonicalKey(pool, Number(row.id));
     }
   }
 
