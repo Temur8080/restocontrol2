@@ -1257,16 +1257,12 @@ function App() {
   const [adminSubModalOpen, setAdminSubModalOpen] = useState(false);
   const [adminSubModalPersistent, setAdminSubModalPersistent] = useState(false);
   const [adminSubModalDismissed, setAdminSubModalDismissed] = useState(false);
-  const [subscriptionNoticeHistory, setSubscriptionNoticeHistory] = useState(() => {
-    try {
-      const raw = localStorage.getItem(SUBSCRIPTION_NOTICE_HISTORY_STORAGE_KEY);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  });
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [subscriptionNoticeHistory, setSubscriptionNoticeHistory] = useState([]);
+  const subscriptionNoticeStorageKey = useMemo(() => {
+    const uid = currentUserId != null ? String(currentUserId) : String(sessionUser || "anon");
+    return `${SUBSCRIPTION_NOTICE_HISTORY_STORAGE_KEY}:${uid}`;
+  }, [currentUserId, sessionUser]);
 
   const [dbMeta, setDbMeta] = useState(null);
   const [dbTable, setDbTable] = useState("employees");
@@ -1446,9 +1442,23 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(SUBSCRIPTION_NOTICE_HISTORY_STORAGE_KEY, JSON.stringify(subscriptionNoticeHistory));
+      const raw = localStorage.getItem(subscriptionNoticeStorageKey);
+      if (!raw) {
+        setSubscriptionNoticeHistory([]);
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      setSubscriptionNoticeHistory(Array.isArray(parsed) ? parsed : []);
+    } catch {
+      setSubscriptionNoticeHistory([]);
+    }
+  }, [subscriptionNoticeStorageKey]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(subscriptionNoticeStorageKey, JSON.stringify(subscriptionNoticeHistory));
     } catch {}
-  }, [subscriptionNoticeHistory]);
+  }, [subscriptionNoticeHistory, subscriptionNoticeStorageKey]);
 
   const attendanceHistoryFiltered = useMemo(() => {
     if (!attendanceHistoryEmployee) return [];
@@ -1493,6 +1503,7 @@ function App() {
       setAuthToken(null);
       setSessionUser("");
       setUserRole("admin");
+      setCurrentUserId(null);
       setMeEmployeeId(null);
       setAdminSubLocked(false);
       setAdminSubNearEnd(false);
@@ -1573,6 +1584,7 @@ function App() {
         const d = await api.bootstrap();
         if (cancelled) return;
         setUserRole(d.userRole || "admin");
+        setCurrentUserId(d.me?.id ?? null);
         setMeEmployeeId(d.me?.employeeId ?? null);
         const emps = Array.isArray(d.employees) ? d.employees.map(migrateEmployeeSchedule) : [];
         setEmployees(emps);

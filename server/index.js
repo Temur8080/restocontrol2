@@ -1729,7 +1729,7 @@ api.get("/bootstrap", async (req, res) => {
 
     res.json({
       userRole,
-      me: { employeeId: myEmployeeId },
+      me: { id: req.auth?.sub ?? null, employeeId: myEmployeeId },
       adminSubscription,
       adminSubscriptionMessage: adminSubscriptionMessage || "",
       salaryCalcDefaultConfig,
