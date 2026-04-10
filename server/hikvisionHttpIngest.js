@@ -777,7 +777,8 @@ async function findTerminalRow(pool, deviceIpNorm, clientIpNorm, preferredTermin
   console.warn(
     `[hikvision http] ${matches.length} terminal bir xil IP maslahati; URL ga ?terminalId=<id> qo'shing (masalan monitoring sozlamasida).`
   );
-  return matches[0];
+  // Noaniq holatda tasodifiy terminalga yozib yubormaymiz.
+  return null;
 }
 
 /**
@@ -869,7 +870,7 @@ export async function handleHikvisionHttpEvent(req, pool) {
     const result = await applyTerminalEvent(pool, terminalRow, ev, emitAttendanceBroadcast);
     if (result.ok) {
       applied += 1;
-    } else if (result.reason) {
+    } else if (result.reason && !result.duplicate) {
       console.warn(`[hikvision http] hodisa saqlanmadi (terminal_id=${terminalRow.id}): ${result.reason}`);
     }
   }

@@ -14,7 +14,7 @@ import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.
 import { resolveSnapshotForTerminalEvent } from "./attendanceFaceImages.js";
 import {
   employeeMatchByNormalizedNameAndFilialSql,
-  employeeMatchByAccessCardSql,
+  employeeMatchByAccessCardAndFilialSql,
 } from "./employeeAccessCards.js";
 import { isCheckoutTerminalType, isExitLikeAccessEvent } from "./hikvisionAccessDirection.js";
 import { isPrivateLanHostname } from "./terminalProbe.js";
@@ -165,10 +165,10 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
     if (terminalKey) {
       const byCard = await pool.query(
         `SELECT id, name, access_card_no FROM employees e
-         WHERE ${employeeMatchByAccessCardSql}
+         WHERE ${employeeMatchByAccessCardAndFilialSql}
          ORDER BY e.id ASC
          LIMIT 1`,
-        [adminId, terminalKey]
+        [adminId, terminalKey, defaultFilial]
       );
       if (byCard.rows.length > 0) {
         const row = byCard.rows[0];
@@ -186,6 +186,7 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
           ]);
           updated += 1;
         }
+        await upsertEmployeeTerminalAlias(pool, Number(row.id), Number(terminalRow.id), terminalKey);
         continue;
       }
     }
@@ -220,15 +221,23 @@ export async function syncEmployeesFromTerminal(pool, terminalRow) {
         ]);
         updated += 1;
       }
+      if (terminalKey) {
+        await upsertEmployeeTerminalAlias(pool, Number(row.id), Number(terminalRow.id), terminalKey);
+      }
       continue;
     }
 
     if (terminalKey) {
-      await pool.query(
+      const ins = await pool.query(
         `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end, access_card_no)
-         VALUES ($1, $2, $3, $4, '09:00', '18:00', $5)`,
+         VALUES ($1, $2, $3, $4, '09:00', '18:00', $5)
+         RETURNING id`,
         [adminId, nm, "Hodim", defaultFilial, terminalKey]
       );
+      const createdId = Number(ins.rows?.[0]?.id || 0);
+      if (createdId > 0) {
+        await upsertEmployeeTerminalAlias(pool, createdId, Number(terminalRow.id), terminalKey);
+      }
     } else {
       await pool.query(
         `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end)
@@ -267,12 +276,51 @@ async function setCursor(pool, terminalId, timeStr) {
   );
 }
 
-async function tryInsertDedupe(pool, terminalId, dedupeKey) {
+async function dedupeKeyExists(pool, terminalId, dedupeKey) {
   const r = await pool.query(
-    `INSERT INTO terminal_event_dedupe (terminal_id, dedupe_key) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    `SELECT 1 FROM terminal_event_dedupe WHERE terminal_id = $1 AND dedupe_key = $2 LIMIT 1`,
     [terminalId, dedupeKey]
   );
-  return r.rowCount > 0;
+  return r.rows.length > 0;
+}
+
+/** Faqat davomat yozuvi muvaffaqiyatli bo‘lgandan keyin chaqiriladi — qayta urinish uchun yo‘l qoldiradi. */
+async function recordDedupeSuccess(pool, terminalId, dedupeKey) {
+  try {
+    await pool.query(
+      `INSERT INTO terminal_event_dedupe (terminal_id, dedupe_key) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [terminalId, dedupeKey]
+    );
+  } catch (e) {
+    console.error(`[terminal] recordDedupeSuccess terminal_id=${terminalId}`, e);
+  }
+}
+
+async function findEmployeeByTerminalAlias(pool, adminId, terminalId, terminalKey) {
+  if (!terminalId || !terminalKey) return null;
+  const r = await pool.query(
+    `SELECT e.id, e.admin_id, e.name, e.shift_start, e.shift_end, e.weekly_schedule
+     FROM employee_terminal_keys k
+     JOIN employees e ON e.id = k.employee_id
+     WHERE k.terminal_id = $1
+       AND LOWER(TRIM(k.terminal_key)) = LOWER(TRIM($2::text))
+       AND e.admin_id = $3
+     ORDER BY e.id ASC
+     LIMIT 1`,
+    [terminalId, terminalKey, adminId]
+  );
+  return r.rows[0] || null;
+}
+
+async function upsertEmployeeTerminalAlias(pool, employeeId, terminalId, terminalKey) {
+  if (!employeeId || !terminalId || !terminalKey) return;
+  await pool.query(
+    `INSERT INTO employee_terminal_keys (employee_id, terminal_id, terminal_key, created_at, updated_at)
+     VALUES ($1, $2, $3, NOW(), NOW())
+     ON CONFLICT (terminal_id, terminal_key)
+     DO UPDATE SET employee_id = EXCLUDED.employee_id, updated_at = NOW()`,
+    [employeeId, terminalId, String(terminalKey).trim()]
+  );
 }
 
 async function getTerminalEventTimezoneOffsetHours(pool) {
@@ -287,22 +335,23 @@ async function getTerminalEventTimezoneOffsetHours(pool) {
  * yoziladi yoki yangilanadi, keyin davomat shu yozuvga bog‘lanadi.
  * Qidiruv: avvalo access_card_no, keyin ism. Mavjud hodim nomi turli terminaldagi boshqacha
  * variantdan faqat avto-yaratilgan "Hodim {id}" / bo‘sh bo‘lsa yangilanadi — aks holda qo‘lda saqlanadi.
- * @returns {Promise<{ ok: boolean, reason?: string }>}
+ * @returns {Promise<{ ok: boolean, duplicate?: boolean, reason?: string }>}
  */
 export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const isCheckoutSource = isCheckoutTerminalType(terminalRow?.terminal_type);
   // Bir admin/filialda nom manbasi sifatida kirish terminalini ustun qilamiz.
   // Chiqish terminalidan kelgan hodisalar attendance uchun ishlaydi, lekin ismni
   // yaratish/yangilashda ishlatilmaydi (xodimlar aralashib ketishini kamaytiradi).
+  // Qidiruv uchun hodisadagi ism har doim ishlatiladi; chiqishda yangi yozuv faqat karta/ID bilan.
   const rawNameFromEvent = normalizeEmployeeEventName(eventEmployeeName(ev));
-  const nameFromEvent = isCheckoutSource ? "" : rawNameFromEvent;
+  const nameForCreateUpdate = isCheckoutSource ? "" : rawNameFromEvent;
   const empKey = eventEmployeeKey(ev);
   const timeIso = eventTimeIso(ev);
 
   if (!timeIso) {
     return { ok: false, reason: "vaqt_yoq (hodisada time/dateTime kerak)" };
   }
-  if (!empKey && !nameFromEvent) {
+  if (!empKey && !rawNameFromEvent) {
     return {
       ok: false,
       reason:
@@ -311,8 +360,9 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   }
 
   const dedupeKey = eventDedupeKey(terminalRow.id, ev);
-  const fresh = await tryInsertDedupe(pool, terminalRow.id, dedupeKey);
-  if (!fresh) return { ok: false, reason: "takroriy_hodisa (oldingi yuborilgan)" };
+  if (await dedupeKeyExists(pool, terminalRow.id, dedupeKey)) {
+    return { ok: false, duplicate: true, reason: "takroriy_hodisa (oldingi yuborilgan)" };
+  }
 
   const tzOffsetHours = await getTerminalEventTimezoneOffsetHours(pool);
   const dt = deviceEventDateTimeWithTargetOffset(timeIso, tzOffsetHours);
@@ -334,28 +384,45 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     empR = await pool.query(
       `SELECT id, admin_id, name, shift_start, shift_end, weekly_schedule
        FROM employees e
-       WHERE ${employeeMatchByAccessCardSql}
+       WHERE ${employeeMatchByAccessCardAndFilialSql}
        ORDER BY e.id ASC
        LIMIT 1`,
-      [adminId, empKey]
+      [adminId, empKey, eventFilial]
     );
+    if (empR.rows.length === 0) {
+      const byAlias = await findEmployeeByTerminalAlias(pool, adminId, Number(terminalRow.id), empKey);
+      if (byAlias) empR = { rows: [byAlias] };
+    }
   }
 
-  if (empR.rows.length === 0 && nameFromEvent) {
+  if (empR.rows.length === 0 && rawNameFromEvent) {
     empR = await pool.query(
       `SELECT id, admin_id, name, shift_start, shift_end, weekly_schedule
        FROM employees e
        WHERE ${employeeMatchByNormalizedNameAndFilialSql}
        ORDER BY e.id ASC
        LIMIT 1`,
-      [adminId, nameFromEvent, eventFilial]
+      [adminId, rawNameFromEvent, eventFilial]
     );
   }
 
   if (empR.rows.length === 0) {
+    if (!empKey && isCheckoutSource) {
+      return {
+        ok: false,
+        reason:
+          "chiqish_terminali: bazada hodim topilmadi — avval kirish terminalida ro‘yxatga oling yoki karta/ID bilan qo‘shing (chiqishdan faqat ism bilan yangi hodim yaratilmaydi)",
+      };
+    }
     const defaultFilial = eventFilial;
-    const newName = nameFromEvent || `Hodim ${String(empKey).trim()}`;
-    const cardVal = empKey ? String(empKey).trim() : null;
+    const keyTrim = empKey ? String(empKey).trim() : "";
+    const newName = keyTrim
+      ? nameForCreateUpdate || `Hodim ${keyTrim}`
+      : rawNameFromEvent;
+    if (!newName) {
+      return { ok: false, reason: "hodim_aniqlanmadi (ism yoki ID kerak)" };
+    }
+    const cardVal = keyTrim || null;
     empR = await pool.query(
       `INSERT INTO employees (admin_id, name, role, filial, shift_start, shift_end, access_card_no)
        VALUES ($1, $2, 'Hodim', $3, '09:00', '18:00', $4)
@@ -365,10 +432,10 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   } else {
     const row = empR.rows[0];
     const prevName = normalizeEmployeeEventName(row.name);
-    if (nameFromEvent) {
-      const next = normalizeEmployeeEventName(nameFromEvent);
+    if (nameForCreateUpdate) {
+      const next = normalizeEmployeeEventName(nameForCreateUpdate);
       if (next !== prevName && isPlaceholderOrAutoHodimName(prevName, empKey)) {
-        await pool.query(`UPDATE employees SET name = $1 WHERE id = $2`, [nameFromEvent, row.id]);
+        await pool.query(`UPDATE employees SET name = $1 WHERE id = $2`, [nameForCreateUpdate, row.id]);
       }
     }
     if (empKey) {
@@ -383,6 +450,9 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
 
   const emp = empR.rows[0];
   const eid = Number(emp.id);
+  if (empKey) {
+    await upsertEmployeeTerminalAlias(pool, eid, Number(terminalRow.id), empKey);
+  }
 
   const chiqishQurilma = isCheckoutSource;
   // Chiqish deb belgilangan terminal: minor va boshqa maydonlardan qat'iy nazar chiqish.
@@ -419,6 +489,7 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     if (rows[0] && broadcast && adminId != null) {
       broadcast({ adminId, records: [rowToAttendanceRow(rows[0])] });
     }
+    await recordDedupeSuccess(pool, terminalRow.id, dedupeKey);
     return { ok: true };
   }
 
@@ -449,6 +520,7 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   if (rows[0] && broadcast && adminId != null) {
     broadcast({ adminId, records: [rowToAttendanceRow(rows[0])] });
   }
+  await recordDedupeSuccess(pool, terminalRow.id, dedupeKey);
   return { ok: true };
 }
 
@@ -498,18 +570,27 @@ async function pollOneTerminal(pool, terminalRow, broadcast) {
   const list = Array.isArray(events) ? [...events] : [];
   list.sort((a, b) => String(eventTimeIso(a) || "").localeCompare(String(eventTimeIso(b) || "")));
 
-  let maxTime = cursor;
+  let maxAppliedTime = cursor;
   for (const ev of list) {
     const ti = eventTimeIso(ev);
-    if (ti && ti > maxTime) maxTime = ti;
-    await applyTerminalEvent(pool, terminalRow, ev, broadcast).catch((e) => {
+    let result;
+    try {
+      result = await applyTerminalEvent(pool, terminalRow, ev, broadcast);
+    } catch (e) {
       console.error(`[terminal poll] id=${terminalRow.id} applyTerminalEvent`, e);
-      return { ok: false };
-    });
+      result = { ok: false, reason: String(e?.message || e) };
+    }
+    // Muvaffaqiyat yoki avvalgi sessiyada allaqachon qayta ishlangan (duplicate) — kursor ilgarilaydi.
+    // Boshqa xato (masalan chiqish_mumkin_emas) — shu hodisadan keyingi vaqtlarni o‘tkazib yubormaslik uchun to‘xtaymiz.
+    if (result.ok || result.duplicate) {
+      if (ti && ti > maxAppliedTime) maxAppliedTime = ti;
+    } else {
+      break;
+    }
   }
 
-  if (maxTime && maxTime !== cursor) {
-    await setCursor(pool, terminalRow.id, maxTime);
+  if (maxAppliedTime && maxAppliedTime !== cursor) {
+    await setCursor(pool, terminalRow.id, maxAppliedTime);
   }
 }
 

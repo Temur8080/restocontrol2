@@ -194,6 +194,18 @@ export async function initSchema() {
       PRIMARY KEY (terminal_id, dedupe_key)
     );
 
+    CREATE TABLE IF NOT EXISTS employee_terminal_keys (
+      employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+      terminal_id INTEGER NOT NULL REFERENCES terminals(id) ON DELETE CASCADE,
+      terminal_key TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (terminal_id, terminal_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_employee_terminal_keys_employee_id
+      ON employee_terminal_keys(employee_id);
+
     CREATE INDEX IF NOT EXISTS idx_terminal_event_dedupe_created ON terminal_event_dedupe (created_at);
   `);
 

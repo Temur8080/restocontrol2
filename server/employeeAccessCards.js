@@ -36,3 +36,26 @@ export const employeeMatchByAccessCardSql = `
     )
   )
 `;
+
+/**
+ * Terminal hodisa kaliti (employeeNoString / cardNo) ↔ employees.access_card_no (admin + filial).
+ * $1 = admin_id, $2 = terminaldan kelgan qator (trim), $3 = filial.
+ * Izoh: Hikvision employeeNo ko'p hollarda filiallar orasida takrorlanadi (1,2,3...),
+ * shuning uchun filial bo'yicha ham cheklaymiz; '*' global yozuvlar ham mos keladi.
+ */
+export const employeeMatchByAccessCardAndFilialSql = `
+  e.admin_id = $1::int
+  AND (
+    COALESCE(NULLIF(TRIM(e.filial), ''), 'Asosiy filial') = COALESCE(NULLIF(TRIM($3::text), ''), 'Asosiy filial')
+    OR COALESCE(NULLIF(TRIM(e.filial), ''), 'Asosiy filial') = '*'
+  )
+  AND COALESCE(NULLIF(TRIM(e.access_card_no), ''), '') <> ''
+  AND (
+    LOWER(TRIM(COALESCE(e.access_card_no, ''))) = LOWER(TRIM($2::text))
+    OR (
+      TRIM(COALESCE(e.access_card_no, '')) ~ '^[0-9]+$'
+      AND TRIM($2::text) ~ '^[0-9]+$'
+      AND TRIM(COALESCE(e.access_card_no, ''))::bigint = TRIM($2::text)::bigint
+    )
+  )
+`;

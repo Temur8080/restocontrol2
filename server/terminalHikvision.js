@@ -371,7 +371,8 @@ export function normalizeEmployeeEventName(raw) {
 }
 
 export function eventTimeIso(ev) {
-  const t = ev?.time ?? ev?.Time;
+  if (!ev || typeof ev !== "object") return "";
+  const t = ev.time ?? ev.Time ?? ev.dateTime ?? ev.DateTime;
   return t != null ? String(t).trim() : "";
 }
 
@@ -382,7 +383,8 @@ export function eventDedupeKey(terminalId, ev) {
   const minor = ev?.minor ?? ev?.Minor ?? "";
   const serial = ev?.serialNo ?? ev?.SerialNo ?? "";
   if (serial !== "" && serial != null) return `${terminalId}|${serial}`;
-  const identity = nameNorm || eventEmployeeKey(ev);
+  // Karta/ID bir xil ismdan ustun — aks holda turli odamlar bir dedupe kalitiga yopishishi mumkin.
+  const identity = eventEmployeeKey(ev) || nameNorm;
   return `${terminalId}|${time}|${identity}|${major}|${minor}`;
 }
 
