@@ -262,6 +262,21 @@ export const translations = {
       terminalSyncErrorTitle: "Sinxron xatosi",
       terminalSyncSummarySingle:
         "Skan: {scanned} yozuv ({pages} so‘rov). Ismli import: {total}. Yangi: {created}, yangilangan: {updated}. Record bilan aniqlangan: {enriched}.",
+      terminalSyncModal: {
+        terminals: "Terminallar",
+        created: "Yangi hodimlar",
+        updated: "Yangilangan hodimlar",
+        dbTotalEmployees: "DB dagi jami hodimlar",
+        mergedTitle: "Birlashgan dublikatlar",
+        mergedItem: "{count} ta yozuv birlashtirildi",
+        duplicatesTitle: "Dublikat hodimlar (birlashtirish)",
+        nameLabel: "Ism:",
+        noCard: "karta yo'q",
+        primary: "Asosiy",
+        merging: "Birlashtirilmoqda...",
+        mergeToPrimary: "Asosiyga birlashtirish",
+        mergeSuccess: "Dublikatlar birlashtirildi. Hodim endi barcha filiallarda ishlaydi.",
+      },
     },
     salary: {
       rateKind: {
@@ -555,9 +570,9 @@ export const translations = {
       policyEnabledOn: "Yoqilgan",
       policyEnabledOff: "O‘chirilgan",
       lateGraceMinutes: "Kechikish (daqiqa)",
-      latePerMinute: "Jarima / min",
+      latePerMinute: "Jarima / min (so'm)",
       maxDailyFine: "Maksimal (so'm/kun)",
-      bonusPerMinute: "Bonus / min",
+      bonusPerMinute: "Bonus / min (so'm)",
       bonusGraceMinutes: "Bonus uchun chegara (min)",
       bonusGraceHelp: "Smena vaqtidan qancha ortiqcha ishlagandan keyin bonus hisoblash boshlanadi.",
       employeeOverrideTitle: "Hodimga alohida normativ",
@@ -868,6 +883,21 @@ export const translations = {
       terminalSyncErrorTitle: "Ошибка синхронизации",
       terminalSyncSummarySingle:
         "Скан: {scanned} записей ({pages} запросов). С именами для импорта: {total}. Новых: {created}, обновлено: {updated}. Через Record: {enriched}.",
+      terminalSyncModal: {
+        terminals: "Терминалы",
+        created: "Новые сотрудники",
+        updated: "Обновлённые сотрудники",
+        dbTotalEmployees: "Всего сотрудников в БД",
+        mergedTitle: "Объединённые дубликаты",
+        mergedItem: "объединено записей: {count}",
+        duplicatesTitle: "Дубликаты сотрудников (объединение)",
+        nameLabel: "Имя:",
+        noCard: "карты нет",
+        primary: "Основной",
+        merging: "Объединение...",
+        mergeToPrimary: "Объединить в основной",
+        mergeSuccess: "Дубликаты объединены. Сотрудник теперь может работать во всех филиалах.",
+      },
     },
     salary: {
       rateKind: {
@@ -1472,6 +1502,21 @@ export const translations = {
       terminalSyncErrorTitle: "Sync error",
       terminalSyncSummarySingle:
         "Scanned {scanned} rows ({pages} calls). With names for import: {total}. New: {created}, updated: {updated}. Record enriched: {enriched}.",
+      terminalSyncModal: {
+        terminals: "Terminals",
+        created: "New employees",
+        updated: "Updated employees",
+        dbTotalEmployees: "Total employees in DB",
+        mergedTitle: "Merged duplicates",
+        mergedItem: "{count} records merged",
+        duplicatesTitle: "Duplicate employees (merge)",
+        nameLabel: "Name:",
+        noCard: "no card",
+        primary: "Primary",
+        merging: "Merging...",
+        mergeToPrimary: "Merge into primary",
+        mergeSuccess: "Duplicates merged. The employee can now work across all branches.",
+      },
     },
     salary: {
       rateKind: {

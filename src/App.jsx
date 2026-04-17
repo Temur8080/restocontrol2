@@ -128,6 +128,19 @@ function normalizeFilialInput(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
+function parseNonNegativeIntInput(raw) {
+  if (raw === "") return "";
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return "";
+  return Math.max(0, Math.trunc(n));
+}
+
+function normalizeNonNegativeIntValue(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.trunc(n));
+}
+
 function isValidIpAddress(value) {
   const v = String(value || "").trim();
   if (!v) return false;
@@ -701,8 +714,16 @@ function getEmployeeEarnedSalary(employee, dateStr, attendance, roleSalaries, ov
 
   if (type === "soat") {
     const attendanceMode = salaryCalcConfig?.attendanceMode === "all_segments" ? "all_segments" : "first_last";
-    const hours = getWorkedHoursOnDay(employee, dateStr, attendance, attendanceMode);
-    return Math.round((rate.amount || 0) * hours);
+    const hours = Math.max(0, getWorkedHoursOnDay(employee, dateStr, attendance, attendanceMode));
+    const capHourlyToShift = salaryCalcConfig?.capHourlyToShift === true;
+    let payableHours = hours;
+    if (capHourlyToShift) {
+      const shiftStartMin = toMinutes(sh.start || "09:00");
+      const shiftEndMin = toMinutes(sh.end || "18:00");
+      const shiftHours = Math.max(0, shiftEndMin - shiftStartMin) / 60;
+      payableHours = shiftHours > 0 ? Math.min(hours, shiftHours) : hours;
+    }
+    return Math.round((rate.amount || 0) * payableHours);
   }
 
   if (type === "hafta") {
@@ -961,7 +982,14 @@ function computeHisobotTableRowMetrics(employee, ctx) {
     salaryCalcAttendanceMode,
     salaryCalcConfigsByFilial,
     salaryCalcDefaultConfig,
+    salaryPolicy,
+    salaryPolicyEmployeeOverrides,
   } = ctx;
+  const hasEmpPolicyOverride = Object.prototype.hasOwnProperty.call(
+    salaryPolicyEmployeeOverrides || {},
+    String(employee?.id ?? "")
+  );
+  const policyEnabled = salaryPolicy?.enabled !== false || hasEmpPolicyOverride;
   const empFilial = getEmployeeFilialRaw(employee);
   const cfg =
     empFilial === salaryCalcSelectedFilial
@@ -971,9 +999,15 @@ function computeHisobotTableRowMetrics(employee, ctx) {
           monthMode: salaryCalcMonthMode,
           monthFixed: salaryCalcMonthFixed,
           attendanceMode: salaryCalcAttendanceMode,
+          capHourlyToShift: !policyEnabled,
         }
-      : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
+      : {
+          ...(salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig || {}),
+          capHourlyToShift: !policyEnabled,
+        };
   const rate = getEmployeeSalary(employee, roleSalaries, employeeSalaryOverrides);
+  const rateKind = normalizeSalaryRateType(rate);
+  const payCfg = rateKind === "soat" ? { ...cfg, capHourlyToShift: true } : cfg;
   const hasOverride = employeeSalaryOverrides[String(employee.id)] != null;
   const { from: repFrom, to: repTo } = clampSalaryReportRange(
     salaryReportMonth,
@@ -988,7 +1022,7 @@ function computeHisobotTableRowMetrics(employee, ctx) {
     attendanceRecords,
     roleSalaries,
     employeeSalaryOverrides,
-    cfg
+    payCfg
   );
   const paidMonthAmount = (salaryPayments || []).reduce((acc, p) => {
     if (!sameEmployeeId(p.employeeId, employee.id)) return acc;
@@ -997,18 +1031,65 @@ function computeHisobotTableRowMetrics(employee, ctx) {
     const amt = Number(p.amount);
     return acc + (Number.isFinite(amt) ? Math.max(0, Math.trunc(amt)) : 0);
   }, 0);
+  const empPolicy = salaryPolicyEmployeeOverrides?.[String(employee.id)] || {};
+  const reportGrace = resolveLateGraceForEmployee(employee, salaryPolicy, salaryPolicyEmployeeOverrides);
   const bonusByDate = new Map();
   const fineByDate = new Map();
   const advanceByDate = new Map();
+  for (const dateStr of eachDateStrInMonth(salaryReportMonth)) {
+    if (dateStr < repFrom || dateStr > repTo) continue;
+    const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, reportGrace);
+    const shift = getShiftForDate(employee, dateStr);
+    if (
+      policyEnabled &&
+      att?.current?.checkIn &&
+      shift.work &&
+      isLate(String(att.current.checkIn).trim(), shift.start, reportGrace)
+    ) {
+      const startMin = toMinutes(shift.start || "09:00");
+      const inMin = toMinutes(att.current.checkIn || "00:00");
+      const perMinute = Number.isFinite(Number(empPolicy.latePerMinute))
+        ? Math.max(0, Math.trunc(Number(empPolicy.latePerMinute)))
+        : Math.max(0, Number(salaryPolicy?.latePerMinute) || 0);
+      const maxDailyFine = Number.isFinite(Number(empPolicy.maxDailyFine))
+        ? Math.max(0, Math.trunc(Number(empPolicy.maxDailyFine)))
+        : Math.max(0, Number(salaryPolicy?.maxDailyFine) || 0);
+      const lateMin = Math.max(0, inMin - startMin - reportGrace);
+      const rawAmount = lateMin > 0 ? lateMin * perMinute : 0;
+      const amount = maxDailyFine > 0 ? Math.min(maxDailyFine, rawAmount) : rawAmount;
+      if (amount > 0) fineByDate.set(dateStr, (fineByDate.get(dateStr) || 0) + amount);
+    }
+    if (policyEnabled && att?.current?.checkIn && shift.work) {
+      const startMin = toMinutes(shift.start || "09:00");
+      const endMin = toMinutes(shift.end || "18:00");
+      const shiftDurMin = Math.max(0, endMin - startMin);
+      const workedMin = Math.round(getWorkedHoursOnDay(employee, dateStr, att, cfg?.attendanceMode) * 60);
+      const grace = Number.isFinite(Number(empPolicy?.bonusGraceMinutes))
+        ? Math.max(0, Math.trunc(Number(empPolicy.bonusGraceMinutes)))
+        : Math.max(0, Number(salaryPolicy?.bonusGraceMinutes) || 0);
+      const bonusPerMinute = Number.isFinite(Number(empPolicy?.bonusPerMinute))
+        ? Math.max(0, Math.trunc(Number(empPolicy.bonusPerMinute)))
+        : Math.max(0, Number(salaryPolicy?.bonusPerMinute) || 0);
+      const extraMin = Math.max(0, workedMin - shiftDurMin - grace);
+      const amount = extraMin > 0 ? extraMin * bonusPerMinute : 0;
+      if (amount > 0) bonusByDate.set(dateStr, (bonusByDate.get(dateStr) || 0) + amount);
+    }
+  }
   for (const adj of salaryAdjustments || []) {
     if (!sameEmployeeId(adj.employeeId, employee.id)) continue;
     const d = toAttendanceDateKey(adj.date);
     if (!d || d < repFrom || d > repTo) continue;
     const amt = Math.max(0, Math.trunc(Number(adj.amount) || 0));
     const kind = normalizeAdjustmentKind(adj.kind);
-    if (kind === "fine") fineByDate.set(d, (fineByDate.get(d) || 0) + amt);
+    if (kind === "fine") {
+      if (!policyEnabled) continue;
+      fineByDate.set(d, (fineByDate.get(d) || 0) + amt);
+    }
     else if (kind === "advance") advanceByDate.set(d, (advanceByDate.get(d) || 0) + amt);
-    else if (kind === "bonus") bonusByDate.set(d, (bonusByDate.get(d) || 0) + amt);
+    else if (kind === "bonus") {
+      if (!policyEnabled) continue;
+      bonusByDate.set(d, (bonusByDate.get(d) || 0) + amt);
+    }
   }
   let bonusMonth = 0;
   let fineMonth = 0;
@@ -1026,14 +1107,14 @@ function computeHisobotTableRowMetrics(employee, ctx) {
   let paidWorkedHoursMonth = 0;
   for (const dateStr of eachDateStrInMonth(salaryReportMonth)) {
     if (dateStr < repFrom || dateStr > repTo) continue;
-    const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, 5);
+    const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, reportGrace);
     const dayPay = getEmployeeEarnedSalary(
       employee,
       dateStr,
       att,
       roleSalaries,
       employeeSalaryOverrides,
-      cfg
+      payCfg
     );
     if (dayPay <= 0) continue;
     const paidDateAmount = (salaryPayments || []).reduce((acc, p) => {
@@ -1212,6 +1293,7 @@ function App() {
     message: "",
     isError: false,
     duplicateGroups: [],
+    mergedSummary: [],
   });
   const [terminalMergeBusyKey, setTerminalMergeBusyKey] = useState("");
 
@@ -2000,13 +2082,21 @@ function App() {
     if (userRole !== "admin") return employees;
     if (!Array.isArray(adminFilials) || adminFilials.length <= 1) return employees;
     const allowed = new Set(adminFilials);
-    return employees.filter((e) => allowed.has(getEmployeeFilialRaw(e)));
+    return employees.filter((e) => {
+      const filial = getEmployeeFilialRaw(e);
+      if (filial === "*") return true;
+      return allowed.has(filial);
+    });
   }, [employees, userRole, adminFilials]);
 
   const employeesInScope = useMemo(() => {
     const base = userRole === "admin" ? employeesForRole : employees;
     if (filialFilter === "all") return base;
-    return base.filter((employee) => getEmployeeFilialRaw(employee) === filialFilter);
+    return base.filter((employee) => {
+      const filial = getEmployeeFilialRaw(employee);
+      if (filial === "*") return true;
+      return filial === filialFilter;
+    });
   }, [employees, employeesForRole, userRole, filialFilter]);
 
   const employeesAfterCardFilter = useMemo(() => {
@@ -2031,6 +2121,11 @@ function App() {
   const salaryReportRows = useMemo(() => {
     if (activeMenu !== "Hisobot") return null;
     return employeesAfterCardFilter.map((employee) => {
+      const hasEmpPolicyOverride = Object.prototype.hasOwnProperty.call(
+        salaryPolicyEmployeeOverrides || {},
+        String(employee?.id ?? "")
+      );
+      const policyEnabled = salaryPolicy?.enabled !== false || hasEmpPolicyOverride;
       const empFilial = getEmployeeFilialRaw(employee);
       const cfg =
         empFilial === salaryCalcSelectedFilial
@@ -2040,10 +2135,18 @@ function App() {
               monthMode: salaryCalcMonthMode,
               monthFixed: salaryCalcMonthFixed,
               attendanceMode: salaryCalcAttendanceMode,
+              capHourlyToShift: !policyEnabled,
             }
-          : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
+          : {
+              ...(salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig || {}),
+              capHourlyToShift: !policyEnabled,
+            };
       const rate = getEmployeeSalary(employee, roleSalaries, employeeSalaryOverrides);
       const rateKind = normalizeSalaryRateType(rate);
+      const payCfg =
+        policyEnabled && rateKind === "soat"
+          ? { ...cfg, capHourlyToShift: true }
+          : cfg;
       const { from: rFrom, to: rTo } = clampSalaryReportRange(
         salaryReportMonth,
         salaryReportRangeFrom,
@@ -2057,7 +2160,7 @@ function App() {
         attendanceRecords,
         roleSalaries,
         employeeSalaryOverrides,
-        cfg
+        payCfg
       );
       const paidMonth = (salaryPayments || []).reduce((acc, p) => {
         if (!sameEmployeeId(p.employeeId, employee.id)) return acc;
@@ -2066,18 +2169,65 @@ function App() {
         const amt = Number(p.amount);
         return acc + (Number.isFinite(amt) ? Math.max(0, Math.trunc(amt)) : 0);
       }, 0);
+      const empPolicy = salaryPolicyEmployeeOverrides?.[String(employee.id)] || {};
+      const reportGrace = resolveLateGraceForEmployee(employee, salaryPolicy, salaryPolicyEmployeeOverrides);
       let bonusMonth = 0;
       let fineMonth = 0;
       let advanceMonth = 0;
+      for (const dateStr of eachDateStrInMonth(salaryReportMonth)) {
+        if (dateStr < rFrom || dateStr > rTo) continue;
+        const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, reportGrace);
+        const shift = getShiftForDate(employee, dateStr);
+        if (
+          policyEnabled &&
+          att?.current?.checkIn &&
+          shift.work &&
+          isLate(String(att.current.checkIn).trim(), shift.start, reportGrace)
+        ) {
+          const startMin = toMinutes(shift.start || "09:00");
+          const inMin = toMinutes(att.current.checkIn || "00:00");
+          const perMinute = Number.isFinite(Number(empPolicy.latePerMinute))
+            ? Math.max(0, Math.trunc(Number(empPolicy.latePerMinute)))
+            : Math.max(0, Number(salaryPolicy?.latePerMinute) || 0);
+          const maxDailyFine = Number.isFinite(Number(empPolicy.maxDailyFine))
+            ? Math.max(0, Math.trunc(Number(empPolicy.maxDailyFine)))
+            : Math.max(0, Number(salaryPolicy?.maxDailyFine) || 0);
+          const lateMin = Math.max(0, inMin - startMin - reportGrace);
+          const rawAmount = lateMin > 0 ? lateMin * perMinute : 0;
+          const amount = maxDailyFine > 0 ? Math.min(maxDailyFine, rawAmount) : rawAmount;
+          fineMonth += Math.max(0, Math.trunc(amount || 0));
+        }
+        if (policyEnabled && att?.current?.checkIn && shift.work) {
+          const startMin = toMinutes(shift.start || "09:00");
+          const endMin = toMinutes(shift.end || "18:00");
+          const shiftDurMin = Math.max(0, endMin - startMin);
+          const workedMin = Math.round(getWorkedHoursOnDay(employee, dateStr, att, cfg?.attendanceMode) * 60);
+          const grace = Number.isFinite(Number(empPolicy?.bonusGraceMinutes))
+            ? Math.max(0, Math.trunc(Number(empPolicy.bonusGraceMinutes)))
+            : Math.max(0, Number(salaryPolicy?.bonusGraceMinutes) || 0);
+          const bonusPerMinute = Number.isFinite(Number(empPolicy?.bonusPerMinute))
+            ? Math.max(0, Math.trunc(Number(empPolicy.bonusPerMinute)))
+            : Math.max(0, Number(salaryPolicy?.bonusPerMinute) || 0);
+          const extraMin = Math.max(0, workedMin - shiftDurMin - grace);
+          const amount = extraMin > 0 ? extraMin * bonusPerMinute : 0;
+          bonusMonth += Math.max(0, Math.trunc(amount || 0));
+        }
+      }
       for (const adj of salaryAdjustments || []) {
         if (!sameEmployeeId(adj.employeeId, employee.id)) continue;
         const d = toAttendanceDateKey(adj.date);
         if (!d || d < rFrom || d > rTo) continue;
         const amt = Math.max(0, Math.trunc(Number(adj.amount) || 0));
         const kind = normalizeAdjustmentKind(adj.kind);
-        if (kind === "fine") fineMonth += amt;
+        if (kind === "fine") {
+          if (!policyEnabled) continue;
+          fineMonth += amt;
+        }
         else if (kind === "advance") advanceMonth += amt;
-        else if (kind === "bonus") bonusMonth += amt;
+        else if (kind === "bonus") {
+          if (!policyEnabled) continue;
+          bonusMonth += amt;
+        }
       }
       const adjustedPay = Math.max(0, pay + bonusMonth - fineMonth - advanceMonth);
       const remaining = Math.max(0, adjustedPay - paidMonth);
@@ -2103,6 +2253,8 @@ function App() {
     salaryCalcAttendanceMode,
     salaryCalcConfigsByFilial,
     salaryCalcDefaultConfig,
+    salaryPolicy,
+    salaryPolicyEmployeeOverrides,
   ]);
 
   const salaryReportBreakdown = useMemo(() => {
@@ -2181,6 +2333,8 @@ function App() {
       salaryCalcAttendanceMode,
       salaryCalcConfigsByFilial,
       salaryCalcDefaultConfig,
+      salaryPolicy,
+      salaryPolicyEmployeeOverrides,
     }),
     [
       salaryReportMonth,
@@ -2200,6 +2354,8 @@ function App() {
       salaryCalcAttendanceMode,
       salaryCalcConfigsByFilial,
       salaryCalcDefaultConfig,
+      salaryPolicy,
+      salaryPolicyEmployeeOverrides,
     ]
   );
 
@@ -2449,6 +2605,14 @@ function App() {
 
   const reportDetailData = useMemo(() => {
     if (!reportDetailEmployee) return null;
+    const hasEmpPolicyOverride = Object.prototype.hasOwnProperty.call(
+      salaryPolicyEmployeeOverrides || {},
+      String(reportDetailEmployee?.id ?? "")
+    );
+    const policyEnabled = salaryPolicy?.enabled !== false || hasEmpPolicyOverride;
+    const reportRate = getEmployeeSalary(reportDetailEmployee, roleSalaries, employeeSalaryOverrides);
+    const reportRateType = normalizeSalaryRateType(reportRate);
+    const reportRateAmount = Math.max(0, Number(reportRate?.amount) || 0);
     const empFilial = getEmployeeFilialRaw(reportDetailEmployee);
     const cfg =
       empFilial === salaryCalcSelectedFilial
@@ -2458,8 +2622,12 @@ function App() {
             monthMode: salaryCalcMonthMode,
             monthFixed: salaryCalcMonthFixed,
             attendanceMode: salaryCalcAttendanceMode,
+            capHourlyToShift: !policyEnabled,
           }
-        : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
+        : {
+            ...(salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig || {}),
+            capHourlyToShift: !policyEnabled,
+          };
 
     const daysAll = eachDateStrInMonth(reportDetailMonth);
     const detailClip =
@@ -2496,13 +2664,17 @@ function App() {
       if (dateStr < detailClip.from || dateStr > detailClip.to) continue;
       const att = getEmployeeAttendance(reportDetailEmployee, attendanceRecords, dateStr, reportGrace);
       const shift = getShiftForDate(reportDetailEmployee, dateStr);
+      const payCfg =
+        policyEnabled && reportRateType === "soat"
+          ? { ...cfg, capHourlyToShift: true }
+          : cfg;
       const pay = getEmployeeEarnedSalary(
         reportDetailEmployee,
         dateStr,
         att,
         roleSalaries,
         employeeSalaryOverrides,
-        cfg
+        payCfg
       );
       if (pay > 0) {
         salaryTotal += pay;
@@ -2519,11 +2691,6 @@ function App() {
         });
       }
       const empPolicy = salaryPolicyEmployeeOverrides?.[String(reportDetailEmployee.id)] || {};
-      const hasEmpOverride = Object.prototype.hasOwnProperty.call(
-        salaryPolicyEmployeeOverrides || {},
-        String(reportDetailEmployee.id)
-      );
-      const policyEnabled = salaryPolicy?.enabled !== false || hasEmpOverride;
       if (
         policyEnabled &&
         att?.current?.checkIn &&
@@ -2551,8 +2718,12 @@ function App() {
           const workedMin = Math.round(
             getWorkedHoursOnDay(reportDetailEmployee, dateStr, att, cfg?.attendanceMode) * 60
           );
-          const grace = Math.max(0, Number(salaryPolicy?.bonusGraceMinutes) || 0);
-          const bonusPerMinute = Math.max(0, Number(salaryPolicy?.bonusPerMinute) || 0);
+          const grace = Number.isFinite(Number(empPolicy?.bonusGraceMinutes))
+            ? Math.max(0, Math.trunc(Number(empPolicy.bonusGraceMinutes)))
+            : Math.max(0, Number(salaryPolicy?.bonusGraceMinutes) || 0);
+          const bonusPerMinute = Number.isFinite(Number(empPolicy?.bonusPerMinute))
+            ? Math.max(0, Math.trunc(Number(empPolicy.bonusPerMinute)))
+            : Math.max(0, Number(salaryPolicy?.bonusPerMinute) || 0);
           const extraMin = Math.max(0, workedMin - shiftDurMin - grace);
           const amount = extraMin > 0 ? extraMin * bonusPerMinute : 0;
           if (amount > 0) bonusItems.push({ date: dateStr, extraMin, amount, auto: true, note: "Ko'p ishlagan" });
@@ -2576,9 +2747,15 @@ function App() {
         note: adj.note || "",
       };
       const k = normalizeAdjustmentKind(adj.kind);
-      if (k === "fine") fineItems.push(item);
+      if (k === "fine") {
+        if (!policyEnabled) continue;
+        fineItems.push(item);
+      }
       else if (k === "advance") advanceItems.push(item);
-      else bonusItems.push(item);
+      else {
+        if (!policyEnabled) continue;
+        bonusItems.push(item);
+      }
     }
 
     const bonusTotal = bonusItems.reduce((a, x) => a + (Number(x.amount) || 0), 0);
@@ -2676,6 +2853,11 @@ function App() {
   ]);
 
   const getSalaryCalcConfigForEmployee = useCallback((employee) => {
+    const hasEmpPolicyOverride = Object.prototype.hasOwnProperty.call(
+      salaryPolicyEmployeeOverrides || {},
+      String(employee?.id ?? "")
+    );
+    const capHourlyToShift = salaryPolicy?.enabled === false && !hasEmpPolicyOverride;
     const empFilial = getEmployeeFilialRaw(employee);
     if (empFilial === salaryCalcSelectedFilial) {
       return {
@@ -2684,9 +2866,13 @@ function App() {
         monthMode: salaryCalcMonthMode,
         monthFixed: salaryCalcMonthFixed,
         attendanceMode: salaryCalcAttendanceMode,
+        capHourlyToShift,
       };
     }
-    return salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
+    return {
+      ...(salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig || {}),
+      capHourlyToShift,
+    };
   }, [
     salaryCalcSelectedFilial,
     salaryCalcWeekMode,
@@ -2696,10 +2882,12 @@ function App() {
     salaryCalcAttendanceMode,
     salaryCalcConfigsByFilial,
     salaryCalcDefaultConfig,
+    salaryPolicy,
+    salaryPolicyEmployeeOverrides,
   ]);
 
   const formatCalendarDayAmount = useCallback(
-    (n) => `${Math.trunc(Number(n) || 0).toLocaleString(localeToBcp47(locale))}so'm`,
+    (n) => `${Math.trunc(Number(n) || 0).toLocaleString(localeToBcp47(locale))} so'm`,
     [locale]
   );
 
@@ -4015,7 +4203,13 @@ function App() {
   }
 
   function closeTerminalSyncResultModal() {
-    setTerminalSyncResultModal({ open: false, message: "", isError: false, duplicateGroups: [] });
+    setTerminalSyncResultModal((prev) => ({
+      ...prev,
+      open: false,
+      message: "",
+      isError: false,
+      duplicateGroups: [],
+    }));
     setTerminalMergeBusyKey("");
   }
 
@@ -4043,19 +4237,33 @@ function App() {
         pages: syncRes?.pagesTotal ?? 0,
         enriched: syncRes?.enrichedTotal ?? 0,
       });
-      setTerminalSyncResultModal({
+      setTerminalSyncResultModal((prev) => ({
+        ...prev,
         open: true,
         isError: false,
         message: dbLoadMessage,
         duplicateGroups: Array.isArray(syncRes?.duplicateGroups) ? syncRes.duplicateGroups : [],
-      });
+        terminals: syncRes?.terminalCount ?? 0,
+        created: syncRes?.created ?? 0,
+        updated: syncRes?.updated ?? 0,
+        scanned: syncRes?.scannedTotal ?? 0,
+        pages: syncRes?.pagesTotal ?? 0,
+        enriched: syncRes?.enrichedTotal ?? 0,
+      }));
     } catch (err) {
-      setTerminalSyncResultModal({
+      setTerminalSyncResultModal((prev) => ({
+        ...prev,
         open: true,
         isError: true,
         message: translateApiError(err instanceof Error ? err.message : String(err), locale),
         duplicateGroups: [],
-      });
+        terminals: undefined,
+        created: undefined,
+        updated: undefined,
+        scanned: undefined,
+        pages: undefined,
+        enriched: undefined,
+      }));
     } finally {
       setTerminalSyncBusy(false);
     }
@@ -4111,16 +4319,47 @@ function App() {
       if (d?.employees) {
         setEmployees(Array.isArray(d.employees) ? d.employees.map(migrateEmployeeSchedule) : []);
       }
-      setTerminalSyncResultModal((prev) => ({
-        ...prev,
-        isError: false,
-        message: locale === "ru"
-          ? "Дубликаты объединены. Сотрудник теперь может работать через все филиалы."
-          : locale === "en"
-            ? "Duplicates merged. Employee can now work across all branches."
-            : "Dublikatlar birlashtirildi. Hodim endi barcha filiallarda ishlaydi.",
-        duplicateGroups: Array.isArray(r?.duplicateGroups) ? r.duplicateGroups : [],
-      }));
+      setTerminalSyncResultModal((prev) => {
+        let mergedSummary = Array.isArray(prev.mergedSummary) ? [...prev.mergedSummary] : [];
+        let mergedName = "";
+
+        if (Array.isArray(prev.duplicateGroups)) {
+          for (const g of prev.duplicateGroups) {
+            const rows = Array.isArray(g?.rows) ? g.rows : [];
+            if (!rows.length) continue;
+            const keep = rows[0];
+            for (const row of rows) {
+              if (
+                (Number(keep.id) === Number(keepEmployeeId) && Number(row.id) === Number(removeEmployeeId)) ||
+                (Number(keep.id) === Number(removeEmployeeId) && Number(row.id) === Number(keepEmployeeId))
+              ) {
+                mergedName = keep?.name || g?.nameNorm || "";
+                break;
+              }
+            }
+            if (mergedName) break;
+          }
+        }
+
+        if (mergedName) {
+          const existing = mergedSummary.find((x) => x.name === mergedName);
+          if (existing) existing.count += 1;
+          else mergedSummary.push({ name: mergedName, count: 1 });
+        }
+
+        return {
+          ...prev,
+          isError: false,
+          message:
+            locale === "ru"
+              ? "Дубликаты объединены. Сотрудник теперь может работать через все филиалы."
+              : locale === "en"
+                ? "Duplicates merged. Employee can now work across all branches."
+                : "Dublikatlar birlashtirildi. Hodim endi barcha filiallarda ishlaydi.",
+          duplicateGroups: Array.isArray(r?.duplicateGroups) ? r.duplicateGroups : [],
+          mergedSummary,
+        };
+      });
     } catch (err) {
       setTerminalSyncResultModal((prev) => ({
         ...prev,
@@ -4726,30 +4965,10 @@ function App() {
                       );
                     }
 
-                    const empFilial = getEmployeeFilialRaw(employee);
-                    const cfg =
-                      empFilial === salaryCalcSelectedFilial
-                        ? {
-                            weekMode: salaryCalcWeekMode,
-                            weekFixed: salaryCalcWeekFixed,
-                            monthMode: salaryCalcMonthMode,
-                            monthFixed: salaryCalcMonthFixed,
-                            attendanceMode: salaryCalcAttendanceMode,
-                          }
-                        : salaryCalcConfigsByFilial?.[empFilial] || salaryCalcDefaultConfig;
                     const rowGrace = resolveLateGraceForEmployee(employee, salaryPolicy, salaryPolicyEmployeeOverrides);
                     const attendance = getEmployeeAttendance(employee, attendanceRecords, selectedDate, rowGrace);
-                    const rate = getEmployeeSalary(employee, roleSalaries, employeeSalaryOverrides);
-                    const hasOverride = employeeSalaryOverrides[String(employee.id)] != null;
-                    const payDay = getEmployeeEarnedSalary(
-                      employee,
-                      selectedDate,
-                      attendance,
-                      roleSalaries,
-                      employeeSalaryOverrides,
-                      cfg
-                    );
-                    const pay = payDay;
+                    const { hasOverride, reportPayDisplay } = computeHisobotTableRowMetrics(employee, hisobotRowCtx);
+                    const pay = reportPayDisplay;
                     return (
                       <tr
                         key={employee.id}
@@ -5559,9 +5778,13 @@ function App() {
                                   onChange={(e) =>
                                     setSalaryPolicy((prev) => ({
                                       ...prev,
-                                      lateGraceMinutes: Number.isFinite(Number(e.target.value))
-                                        ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                        : 0,
+                                      lateGraceMinutes: parseNonNegativeIntInput(e.target.value),
+                                    }))
+                                  }
+                                  onBlur={() =>
+                                    setSalaryPolicy((prev) => ({
+                                      ...prev,
+                                      lateGraceMinutes: normalizeNonNegativeIntValue(prev.lateGraceMinutes),
                                     }))
                                   }
                                 />
@@ -5579,9 +5802,13 @@ function App() {
                                   onChange={(e) =>
                                     setSalaryPolicy((prev) => ({
                                       ...prev,
-                                      latePerMinute: Number.isFinite(Number(e.target.value))
-                                        ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                        : 0,
+                                      latePerMinute: parseNonNegativeIntInput(e.target.value),
+                                    }))
+                                  }
+                                  onBlur={() =>
+                                    setSalaryPolicy((prev) => ({
+                                      ...prev,
+                                      latePerMinute: normalizeNonNegativeIntValue(prev.latePerMinute),
                                     }))
                                   }
                                 />
@@ -5599,9 +5826,13 @@ function App() {
                                   onChange={(e) =>
                                     setSalaryPolicy((prev) => ({
                                       ...prev,
-                                      maxDailyFine: Number.isFinite(Number(e.target.value))
-                                        ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                        : 0,
+                                      maxDailyFine: parseNonNegativeIntInput(e.target.value),
+                                    }))
+                                  }
+                                  onBlur={() =>
+                                    setSalaryPolicy((prev) => ({
+                                      ...prev,
+                                      maxDailyFine: normalizeNonNegativeIntValue(prev.maxDailyFine),
                                     }))
                                   }
                                 />
@@ -5619,9 +5850,13 @@ function App() {
                                   onChange={(e) =>
                                     setSalaryPolicy((prev) => ({
                                       ...prev,
-                                      bonusPerMinute: Number.isFinite(Number(e.target.value))
-                                        ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                        : 0,
+                                      bonusPerMinute: parseNonNegativeIntInput(e.target.value),
+                                    }))
+                                  }
+                                  onBlur={() =>
+                                    setSalaryPolicy((prev) => ({
+                                      ...prev,
+                                      bonusPerMinute: normalizeNonNegativeIntValue(prev.bonusPerMinute),
                                     }))
                                   }
                                 />
@@ -5639,9 +5874,13 @@ function App() {
                                   onChange={(e) =>
                                     setSalaryPolicy((prev) => ({
                                       ...prev,
-                                      bonusGraceMinutes: Number.isFinite(Number(e.target.value))
-                                        ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                        : 0,
+                                      bonusGraceMinutes: parseNonNegativeIntInput(e.target.value),
+                                    }))
+                                  }
+                                  onBlur={() =>
+                                    setSalaryPolicy((prev) => ({
+                                      ...prev,
+                                      bonusGraceMinutes: normalizeNonNegativeIntValue(prev.bonusGraceMinutes),
                                     }))
                                   }
                                 />
@@ -5661,6 +5900,8 @@ function App() {
                                       lateGraceMinutes: salaryPolicy.lateGraceMinutes,
                                       latePerMinute: salaryPolicy.latePerMinute,
                                       maxDailyFine: salaryPolicy.maxDailyFine,
+                                      bonusPerMinute: salaryPolicy.bonusPerMinute,
+                                      bonusGraceMinutes: salaryPolicy.bonusGraceMinutes,
                                     },
                                   }));
                                 }}
@@ -5693,6 +5934,12 @@ function App() {
                                             maxDailyFine: Number.isFinite(Number(cur.maxDailyFine))
                                               ? Math.max(0, Math.trunc(Number(cur.maxDailyFine)))
                                               : salaryPolicy.maxDailyFine,
+                                            bonusPerMinute: Number.isFinite(Number(cur.bonusPerMinute))
+                                              ? Math.max(0, Math.trunc(Number(cur.bonusPerMinute)))
+                                              : salaryPolicy.bonusPerMinute,
+                                            bonusGraceMinutes: Number.isFinite(Number(cur.bonusGraceMinutes))
+                                              ? Math.max(0, Math.trunc(Number(cur.bonusGraceMinutes)))
+                                              : salaryPolicy.bonusGraceMinutes,
                                           };
                                           return copy;
                                         });
@@ -5709,15 +5956,22 @@ function App() {
                                       type="number"
                                       min={0}
                                       inputMode="numeric"
-                                      value={Number(item?.lateGraceMinutes) || 0}
+                                      value={item?.lateGraceMinutes ?? ""}
                                       onChange={(e) =>
                                         setSalaryPolicyEmployeeOverrides((prev) => ({
                                           ...prev,
                                           [empId]: {
                                             ...(prev[empId] || {}),
-                                            lateGraceMinutes: Number.isFinite(Number(e.target.value))
-                                              ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                              : 0,
+                                            lateGraceMinutes: parseNonNegativeIntInput(e.target.value),
+                                          },
+                                        }))
+                                      }
+                                      onBlur={() =>
+                                        setSalaryPolicyEmployeeOverrides((prev) => ({
+                                          ...prev,
+                                          [empId]: {
+                                            ...(prev[empId] || {}),
+                                            lateGraceMinutes: normalizeNonNegativeIntValue(prev?.[empId]?.lateGraceMinutes),
                                           },
                                         }))
                                       }
@@ -5729,15 +5983,22 @@ function App() {
                                       type="number"
                                       min={0}
                                       inputMode="numeric"
-                                      value={Number(item?.latePerMinute) || 0}
+                                      value={item?.latePerMinute ?? ""}
                                       onChange={(e) =>
                                         setSalaryPolicyEmployeeOverrides((prev) => ({
                                           ...prev,
                                           [empId]: {
                                             ...(prev[empId] || {}),
-                                            latePerMinute: Number.isFinite(Number(e.target.value))
-                                              ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                              : 0,
+                                            latePerMinute: parseNonNegativeIntInput(e.target.value),
+                                          },
+                                        }))
+                                      }
+                                      onBlur={() =>
+                                        setSalaryPolicyEmployeeOverrides((prev) => ({
+                                          ...prev,
+                                          [empId]: {
+                                            ...(prev[empId] || {}),
+                                            latePerMinute: normalizeNonNegativeIntValue(prev?.[empId]?.latePerMinute),
                                           },
                                         }))
                                       }
@@ -5749,20 +6010,81 @@ function App() {
                                       type="number"
                                       min={0}
                                       inputMode="numeric"
-                                      value={Number(item?.maxDailyFine) || 0}
+                                      value={item?.maxDailyFine ?? ""}
                                       onChange={(e) =>
                                         setSalaryPolicyEmployeeOverrides((prev) => ({
                                           ...prev,
                                           [empId]: {
                                             ...(prev[empId] || {}),
-                                            maxDailyFine: Number.isFinite(Number(e.target.value))
-                                              ? Math.max(0, Math.trunc(Number(e.target.value)))
-                                              : 0,
+                                            maxDailyFine: parseNonNegativeIntInput(e.target.value),
+                                          },
+                                        }))
+                                      }
+                                      onBlur={() =>
+                                        setSalaryPolicyEmployeeOverrides((prev) => ({
+                                          ...prev,
+                                          [empId]: {
+                                            ...(prev[empId] || {}),
+                                            maxDailyFine: normalizeNonNegativeIntValue(prev?.[empId]?.maxDailyFine),
                                           },
                                         }))
                                       }
                                       placeholder={t("settings.overrideMaxPlaceholder")}
                                       title={t("settings.maxDailyFine")}
+                                    />
+                                    <input
+                                      className="settings-min-input"
+                                      type="number"
+                                      min={0}
+                                      inputMode="numeric"
+                                      value={item?.bonusPerMinute ?? ""}
+                                      onChange={(e) =>
+                                        setSalaryPolicyEmployeeOverrides((prev) => ({
+                                          ...prev,
+                                          [empId]: {
+                                            ...(prev[empId] || {}),
+                                            bonusPerMinute: parseNonNegativeIntInput(e.target.value),
+                                          },
+                                        }))
+                                      }
+                                      onBlur={() =>
+                                        setSalaryPolicyEmployeeOverrides((prev) => ({
+                                          ...prev,
+                                          [empId]: {
+                                            ...(prev[empId] || {}),
+                                            bonusPerMinute: normalizeNonNegativeIntValue(prev?.[empId]?.bonusPerMinute),
+                                          },
+                                        }))
+                                      }
+                                      placeholder={t("settings.bonusPerMinute")}
+                                      title={t("settings.bonusPerMinute")}
+                                    />
+                                    <input
+                                      className="settings-min-input"
+                                      type="number"
+                                      min={0}
+                                      inputMode="numeric"
+                                      value={item?.bonusGraceMinutes ?? ""}
+                                      onChange={(e) =>
+                                        setSalaryPolicyEmployeeOverrides((prev) => ({
+                                          ...prev,
+                                          [empId]: {
+                                            ...(prev[empId] || {}),
+                                            bonusGraceMinutes: parseNonNegativeIntInput(e.target.value),
+                                          },
+                                        }))
+                                      }
+                                      onBlur={() =>
+                                        setSalaryPolicyEmployeeOverrides((prev) => ({
+                                          ...prev,
+                                          [empId]: {
+                                            ...(prev[empId] || {}),
+                                            bonusGraceMinutes: normalizeNonNegativeIntValue(prev?.[empId]?.bonusGraceMinutes),
+                                          },
+                                        }))
+                                      }
+                                      placeholder={t("settings.bonusGraceMinutes")}
+                                      title={t("settings.bonusGraceMinutes")}
                                     />
                                     <button
                                       type="button"
@@ -5818,14 +6140,26 @@ function App() {
                                 } else {
                                   await api.putSalaryCalcConfigFilial(salaryCalcSelectedFilial, payload);
                                 }
+                                const normalizedEmployeeOverrides = Object.fromEntries(
+                                  Object.entries(salaryPolicyEmployeeOverrides || {}).map(([id, item]) => [
+                                    id,
+                                    {
+                                      lateGraceMinutes: normalizeNonNegativeIntValue(item?.lateGraceMinutes),
+                                      latePerMinute: normalizeNonNegativeIntValue(item?.latePerMinute),
+                                      maxDailyFine: normalizeNonNegativeIntValue(item?.maxDailyFine),
+                                      bonusPerMinute: normalizeNonNegativeIntValue(item?.bonusPerMinute),
+                                      bonusGraceMinutes: normalizeNonNegativeIntValue(item?.bonusGraceMinutes),
+                                    },
+                                  ])
+                                );
                                 await api.putSalaryPolicy({
                                   enabled: salaryPolicy.enabled !== false,
-                                  latePerMinute: salaryPolicy.latePerMinute,
-                                  bonusPerMinute: salaryPolicy.bonusPerMinute,
-                                  bonusGraceMinutes: salaryPolicy.bonusGraceMinutes,
-                                  lateGraceMinutes: salaryPolicy.lateGraceMinutes,
-                                  maxDailyFine: salaryPolicy.maxDailyFine,
-                                  employeeOverrides: salaryPolicyEmployeeOverrides,
+                                  latePerMinute: normalizeNonNegativeIntValue(salaryPolicy.latePerMinute),
+                                  bonusPerMinute: normalizeNonNegativeIntValue(salaryPolicy.bonusPerMinute),
+                                  bonusGraceMinutes: normalizeNonNegativeIntValue(salaryPolicy.bonusGraceMinutes),
+                                  lateGraceMinutes: normalizeNonNegativeIntValue(salaryPolicy.lateGraceMinutes),
+                                  maxDailyFine: normalizeNonNegativeIntValue(salaryPolicy.maxDailyFine),
+                                  employeeOverrides: normalizedEmployeeOverrides,
                                 });
                                 await api.putTerminalTimezoneOffset(terminalTimezoneOffsetHours);
                                 setSalaryCalcConfigsByFilial((prev) => {
@@ -8062,9 +8396,46 @@ function App() {
               </button>
             </div>
             <div className="scroll-modern terminal-sync-result-body">
-              <p className={terminalSyncResultModal.isError ? "login-err" : "terminal-sync-result-msg"}>
-                {terminalSyncResultModal.message}
-              </p>
+              {!terminalSyncResultModal.isError ? (
+                <div className="terminal-sync-stats">
+                  <p className="terminal-sync-result-msg">{terminalSyncResultModal.message}</p>
+                  <div className="terminal-sync-summary-grid">
+                    <div className="terminal-sync-summary-item">
+                      <span className="label">Terminallar</span>
+                      <span className="value">{terminalSyncResultModal.terminals ?? "—"}</span>
+                    </div>
+                    <div className="terminal-sync-summary-item">
+                      <span className="label">Yangi hodimlar</span>
+                      <span className="value">{terminalSyncResultModal.created ?? "0"}</span>
+                    </div>
+                    <div className="terminal-sync-summary-item">
+                      <span className="label">Yangilangan hodimlar</span>
+                      <span className="value">{terminalSyncResultModal.updated ?? "0"}</span>
+                    </div>
+                    <div className="terminal-sync-summary-item">
+                      <span className="label">DB dagi jami hodimlar</span>
+                      <span className="value">{employees.length}</span>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="login-err">{terminalSyncResultModal.message}</p>
+              )}
+
+              {Array.isArray(terminalSyncResultModal.mergedSummary) &&
+              terminalSyncResultModal.mergedSummary.length > 0 ? (
+                <div className="terminal-sync-merged-summary">
+                  <h4>Birlashgan dublikatlar</h4>
+                  <ul>
+                    {terminalSyncResultModal.mergedSummary.map((item) => (
+                      <li key={item.name}>
+                        <strong>{item.name}</strong> — {(item.count || 0) + 1} ta yozuv birlashtirildi
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
               {Array.isArray(terminalSyncResultModal.duplicateGroups) &&
               terminalSyncResultModal.duplicateGroups.length > 0 ? (
                 <div className="terminal-sync-duplicates">

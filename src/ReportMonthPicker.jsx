@@ -117,7 +117,7 @@ export function ReportMonthPicker({
   const popoverRef = useRef(null);
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(() => (parseYearMonth(value) ? value : localYearMonth()));
-  const [popoverBox, setPopoverBox] = useState({ top: 0, left: 0, width: 320 });
+  const [popoverBox, setPopoverBox] = useState({ top: 0, left: 0, width: 380 });
   const [selFrom, setSelFrom] = useState("");
   const [selTo, setSelTo] = useState("");
   const [rangeAnchor, setRangeAnchor] = useState(null);
@@ -182,7 +182,8 @@ export function ReportMonthPicker({
     if (!trigger) return;
     const rect = trigger.getBoundingClientRect();
     const margin = 10;
-    const maxW = Math.min(320, window.innerWidth - margin * 2);
+    const preferredW = window.innerWidth >= 1200 ? 420 : 380;
+    const maxW = Math.min(preferredW, window.innerWidth - margin * 2);
     let left = rect.right - maxW;
     left = Math.max(margin, Math.min(left, window.innerWidth - margin - maxW));
     let top = rect.bottom + margin;
@@ -234,7 +235,7 @@ export function ReportMonthPicker({
     (n) => {
       if (typeof formatDayAmount === "function") return formatDayAmount(n);
       const l = localeToBcp47(locale || "uz");
-      return `${Math.trunc(n).toLocaleString(l)}so'm`;
+      return `${Math.trunc(n).toLocaleString(l)} so'm`;
     },
     [formatDayAmount, locale]
   );
