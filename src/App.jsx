@@ -4269,6 +4269,68 @@ function App() {
     }
   }
 
+  async function loadEmployeesFromDbOnly() {
+    if (userRole !== "admin" && userRole !== "superadmin") return;
+    setTerminalSyncBusy(true);
+    try {
+      const d = await api.bootstrap();
+      const employeesFromDb = Array.isArray(d?.employees) ? d.employees.map(migrateEmployeeSchedule) : [];
+      if (d?.employees) {
+        setEmployees(employeesFromDb);
+      }
+      if (d?.attendanceRecords) {
+        setAttendanceRecords(Array.isArray(d.attendanceRecords) ? d.attendanceRecords : []);
+      }
+      setFilialFilter("all");
+      setCardFilter("all");
+
+      let duplicateGroups = [];
+      try {
+        const dup = await api.getDuplicateEmployees();
+        duplicateGroups = Array.isArray(dup?.groups) ? dup.groups : [];
+      } catch {
+        duplicateGroups = [];
+      }
+
+      const message =
+        locale === "ru"
+          ? `Сотрудники загружены из БД: ${employeesFromDb.length}. Групп дублей: ${duplicateGroups.length}.`
+          : locale === "en"
+            ? `Employees loaded from DB: ${employeesFromDb.length}. Duplicate groups: ${duplicateGroups.length}.`
+            : `Hodimlar DB dan yuklandi: ${employeesFromDb.length}. Dublikat guruhlar: ${duplicateGroups.length}.`;
+
+      setTerminalSyncResultModal({
+        open: true,
+        isError: false,
+        message,
+        duplicateGroups,
+        mergedSummary: [],
+        terminals: undefined,
+        created: undefined,
+        updated: undefined,
+        scanned: undefined,
+        pages: undefined,
+        enriched: undefined,
+      });
+    } catch (err) {
+      setTerminalSyncResultModal({
+        open: true,
+        isError: true,
+        message: translateApiError(err instanceof Error ? err.message : String(err), locale),
+        duplicateGroups: [],
+        mergedSummary: [],
+        terminals: undefined,
+        created: undefined,
+        updated: undefined,
+        scanned: undefined,
+        pages: undefined,
+        enriched: undefined,
+      });
+    } finally {
+      setTerminalSyncBusy(false);
+    }
+  }
+
   async function syncTerminalEmployeesFromTable(row) {
     if (!row?.id) return;
     setTerminalTableSyncBusyId(row.id);
@@ -4616,7 +4678,7 @@ function App() {
                       className="employees-toolbar-sync-btn"
                       type="button"
                       disabled={terminalSyncBusy || terminalTableSyncBusyId != null}
-                      onClick={() => pullEmployeesFromTerminals()}
+                      onClick={() => loadEmployeesFromDbOnly()}
                       aria-label={t("employees.terminalSyncAria")}
                       title={t("employees.terminalSyncTitle")}
                     >
