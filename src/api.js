@@ -151,7 +151,8 @@ export const api = {
     request(`/terminals/${encodeURIComponent(String(id))}/test-connection`, { method: "POST", body: "{}" }),
   syncTerminalEmployees: (id) =>
     request(`/terminals/${encodeURIComponent(String(id))}/sync-employees`, { method: "POST", body: "{}" }),
-  syncAllTerminalsEmployees: () => request("/terminals/sync-all-my-employees", { method: "POST", body: "{}" }),
+  // Superadmin ham ishlata olishi uchun universal endpoint.
+  syncAllTerminalsEmployees: () => request("/employees/generate-from-terminals", { method: "POST", body: "{}" }),
   getDuplicateEmployees: () => request("/employees/duplicates"),
   mergeDuplicateEmployees: (keepEmployeeId, removeEmployeeId) =>
     request("/employees/merge-duplicates", {
