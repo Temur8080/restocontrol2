@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
-import { pool, initSchema, migrateAppKvPerAdmin } from "./db.js";
+import { pool, initSchema, migrateAppKvPerAdmin, upsertAppKvRow } from "./db.js";
 import { authMiddleware, signToken, assertJwtConfigured } from "./auth.js";
 import { ensureDefaultAdmin } from "./seed-admin.js";
 import { probeHikvisionTerminal } from "./terminalProbe.js";
@@ -2205,11 +2205,7 @@ api.put("/settings/theme", async (req, res) => {
     if (theme !== "light" && theme !== "dark") {
       return res.status(400).json({ error: "theme: light yoki dark" });
     }
-    await pool.query(
-      `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, 'theme', $2)
-       ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
-      [uid, theme]
-    );
+    await upsertAppKvRow(pool, uid, "theme", theme);
     res.status(204).send();
   } catch (err) {
     console.error(err);
@@ -2255,11 +2251,7 @@ api.put("/settings/salary-policy", async (req, res) => {
     const uid = req.auth?.sub;
     if (uid == null) return res.status(403).json({ error: "Sessiya xatosi" });
     for (const [key, value] of items) {
-      await pool.query(
-        `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)
-         ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
-        [uid, key, value]
-      );
+      await upsertAppKvRow(pool, uid, key, value);
     }
     res.status(204).send();
   } catch (err) {
@@ -2298,11 +2290,7 @@ api.put("/settings/salary-calc", async (req, res) => {
     const uid = req.auth?.sub;
     if (uid == null) return res.status(403).json({ error: "Sessiya xatosi" });
     for (const [key, value] of items) {
-      await pool.query(
-        `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)
-         ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
-        [uid, key, value]
-      );
+      await upsertAppKvRow(pool, uid, key, value);
     }
     res.status(204).send();
   } catch (err) {
@@ -2364,11 +2352,7 @@ api.put("/settings/terminal-timezone", async (req, res) => {
     if (uid == null) return res.status(403).json({ error: "Sessiya xatosi" });
     const raw = Number(req.body?.offsetHours);
     const safe = Number.isFinite(raw) ? Math.max(-12, Math.min(14, raw)) : 5;
-    await pool.query(
-      `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)
-       ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
-      [uid, "terminal_event_timezone_offset_hours", String(safe)]
-    );
+    await upsertAppKvRow(pool, uid, "terminal_event_timezone_offset_hours", String(safe));
     res.status(204).send();
   } catch (err) {
     console.error(err);
@@ -2397,6 +2381,7 @@ async function main() {
   await initSchema();
   assertJwtConfigured();
   await ensureDefaultAdmin();
+  /** Har server ishga tushishida: app_kv ni admin/superadmin bo‘yicha (admin_id, key) ga o‘tkazish (bir marta yoki kerak bo‘lsa). */
   await migrateAppKvPerAdmin(pool);
 
   const { broadcast, attachToHttpServer } = createAttendanceBroadcaster(pool);

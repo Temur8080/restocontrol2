@@ -259,19 +259,25 @@ export async function initSchema() {
  * ensureDefaultAdmin() dan keyin chaqirilishi kerak — users jadvalida kamida bitta foydalanuvchi bo‘lganda.
  */
 export async function migrateAppKvPerAdmin(pool) {
+  console.log("[db] app_kv: server ishga tushishi bilan migratsiya tekshirilmoqda…");
   const client = await pool.connect();
   try {
-    const tc = await client.query(`
-      SELECT kcu.column_name
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-      WHERE tc.table_name = 'app_kv' AND tc.table_schema = 'public' AND tc.constraint_type = 'PRIMARY KEY'
-      ORDER BY kcu.ordinal_position
+    const pkCols = await client.query(`
+      SELECT a.attname AS column_name
+      FROM pg_constraint c
+      JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
+      WHERE c.conrelid = 'app_kv'::regclass AND c.contype = 'p'
+      ORDER BY u.ord
     `);
-    const cols = tc.rows.map((r) => r.column_name);
+    const cols = pkCols.rows.map((r) => r.column_name);
     const pkSig = cols.join(",");
+    if (cols.length === 0) {
+      console.warn("[db] app_kv: primary key topilmadi — migratsiya o‘tkazilmadi.");
+      return;
+    }
     if (pkSig === "admin_id,key" || pkSig === "key,admin_id") {
+      console.log("[db] app_kv: migratsiya kerak emas (har bir admin uchun PK allaqachon mavjud).");
       return;
     }
     if (pkSig !== "key") {
@@ -279,6 +285,7 @@ export async function migrateAppKvPerAdmin(pool) {
       return;
     }
 
+    console.log("[db] app_kv: eski global sxema (faqat key) topildi — avtomatik migratsiya boshlandi…");
     await client.query("BEGIN");
 
     const pkr = await client.query(`
@@ -332,6 +339,14 @@ export async function migrateAppKvPerAdmin(pool) {
 function quoteIdentPg(name) {
   const s = String(name || "").replace(/"/g, '""');
   return `"${s}"`;
+}
+
+/** app_kv: ON CONFLICT (admin_id, key) ba’zi DB larda unique bo‘lmasa xato beradi — UPDATE+INSERT ishonchli. */
+export async function upsertAppKvRow(pool, adminId, key, value) {
+  const v = String(value);
+  const r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [adminId, key, v]);
+  if (r.rowCount > 0) return;
+  await pool.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [adminId, key, v]);
 }
 
 export { pool };
