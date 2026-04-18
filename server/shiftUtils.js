@@ -1,3 +1,5 @@
+import { appKvSelectSingleForUser } from "./appKv.js";
+
 /** Hodim smenasi (frontend getShiftForDate bilan mos). */
 
 function dateKeyFromISO(dateStr) {
@@ -58,13 +60,9 @@ export function computeCheckInLateFlag(row, recordDate, checkInHHMM, graceMinute
   return cin > st + g;
 }
 
-async function fetchLateGraceFallbackForAdmin(pool, adminId) {
-  if (adminId == null || !Number.isFinite(Number(adminId))) return 5;
+export async function fetchLateGraceMinutesForAdmin(pool, adminId) {
   try {
-    const { rows } = await pool.query(
-      `SELECT value FROM app_kv WHERE admin_id = $1 AND key = 'salary_policy_late_grace_minutes' LIMIT 1`,
-      [adminId]
-    );
+    const { rows } = await appKvSelectSingleForUser(pool, adminId, "salary_policy_late_grace_minutes");
     const n = Number(rows[0]?.value);
     if (Number.isFinite(n)) return Math.max(0, Math.trunc(n));
   } catch {
@@ -73,22 +71,20 @@ async function fetchLateGraceFallbackForAdmin(pool, adminId) {
   return 5;
 }
 
-/** Hodim bo‘yicha kechikish «sabr» daqiqalari (admin sozlamalari + salary_policy_employee_overrides). */
-export async function fetchLateGraceForEmployee(pool, employeeId) {
-  let adminId = null;
-  try {
-    const { rows } = await pool.query(`SELECT admin_id FROM employees WHERE id = $1`, [employeeId]);
-    adminId = rows[0]?.admin_id ?? null;
-  } catch {
-    /* ignore */
+/** Hodim bo‘yicha kechikish «sabr» daqiqalari (global + salary_policy_employee_overrides). */
+export async function fetchLateGraceForEmployee(pool, employeeId, adminIdHint = null) {
+  let adminId = adminIdHint;
+  if (adminId == null || !Number.isFinite(Number(adminId))) {
+    try {
+      const admR = await pool.query(`SELECT admin_id FROM employees WHERE id = $1`, [employeeId]);
+      adminId = admR.rows[0]?.admin_id ?? null;
+    } catch {
+      adminId = null;
+    }
   }
-  const fallback = await fetchLateGraceFallbackForAdmin(pool, adminId);
+  const fallback = await fetchLateGraceMinutesForAdmin(pool, adminId);
   try {
-    if (adminId == null) return fallback;
-    const { rows } = await pool.query(
-      `SELECT value FROM app_kv WHERE admin_id = $1 AND key = 'salary_policy_employee_overrides' LIMIT 1`,
-      [adminId]
-    );
+    const { rows } = await appKvSelectSingleForUser(pool, adminId, "salary_policy_employee_overrides");
     const raw = rows[0]?.value;
     if (raw == null || String(raw).trim() === "") return fallback;
     const obj = JSON.parse(String(raw));

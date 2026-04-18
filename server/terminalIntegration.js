@@ -11,6 +11,7 @@ import {
   DEFAULT_TIMEOUT_MS,
 } from "./terminalHikvision.js";
 import { computeCheckInLateFlag, fetchLateGraceForEmployee } from "./shiftUtils.js";
+import { appKvSelectSingleForUser } from "./appKv.js";
 import { resolveSnapshotForTerminalEvent } from "./attendanceFaceImages.js";
 import {
   employeeMatchByNormalizedNameAndFilialSql,
@@ -345,15 +346,8 @@ async function promoteEmployeeToCanonicalKey(pool, employeeId) {
   await pool.query(`UPDATE employees SET access_card_no = $2 WHERE id = $1`, [employeeId, canonical]);
 }
 
-async function getTerminalEventTimezoneOffsetHours(pool, adminId) {
-  const aid = Number(adminId);
-  if (!Number.isFinite(aid)) {
-    return 5;
-  }
-  const { rows } = await pool.query(
-    `SELECT value FROM app_kv WHERE admin_id = $1 AND key = 'terminal_event_timezone_offset_hours' LIMIT 1`,
-    [aid]
-  );
+async function getTerminalEventTimezoneOffsetHours(pool, terminalAdminId) {
+  const { rows } = await appKvSelectSingleForUser(pool, terminalAdminId, "terminal_event_timezone_offset_hours");
   const n = Number(rows[0]?.value);
   if (!Number.isFinite(n)) return 5;
   return Math.max(-12, Math.min(14, n));
@@ -390,14 +384,14 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     return { ok: false, duplicate: true, reason: "takroriy_hodisa (oldingi yuborilgan)" };
   }
 
+  const tzOffsetHours = await getTerminalEventTimezoneOffsetHours(pool, terminalRow.admin_id);
+  const dt = deviceEventDateTimeWithTargetOffset(timeIso, tzOffsetHours);
+  if (!dt) return { ok: false, reason: `vaqt_tahlil_xato (time="${timeIso.slice(0, 80)}")` };
+
   const adminId = Number(terminalRow.admin_id);
   if (!Number.isFinite(adminId)) {
     return { ok: false, reason: "terminal_admin_yoq" };
   }
-
-  const tzOffsetHours = await getTerminalEventTimezoneOffsetHours(pool, adminId);
-  const dt = deviceEventDateTimeWithTargetOffset(timeIso, tzOffsetHours);
-  if (!dt) return { ok: false, reason: `vaqt_tahlil_xato (time="${timeIso.slice(0, 80)}")` };
 
   const eventFilial = await resolveEmployeeFilialForTerminal(pool, terminalRow);
 
@@ -542,7 +536,7 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
     };
   }
 
-  const grace = await fetchLateGraceForEmployee(pool, eid);
+  const grace = await fetchLateGraceForEmployee(pool, eid, adminId);
   const lateFlag = computeCheckInLateFlag(emp, dt.date, dt.time, grace);
 
   const { rows } = await pool.query(

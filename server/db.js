@@ -209,6 +209,27 @@ export async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_terminal_event_dedupe_created ON terminal_event_dedupe (created_at);
   `);
 
+  // app_kv: eski sxema (faqat key PK) — har bir foydalanuvchi/admin uchun alohida kalitlar + global default (admin_id NULL).
+  try {
+    await pool.query(`ALTER TABLE app_kv DROP CONSTRAINT IF EXISTS app_kv_pkey`);
+  } catch (e) {
+    console.warn("[db] app_kv_pkey:", e?.message || e);
+  }
+  await pool.query(`ALTER TABLE app_kv ADD COLUMN IF NOT EXISTS id BIGSERIAL`);
+  try {
+    await pool.query(`ALTER TABLE app_kv ADD CONSTRAINT app_kv_pkey PRIMARY KEY (id)`);
+  } catch (e) {
+    if (!String(e?.message || "").includes("multiple primary keys")) {
+      console.warn("[db] app_kv id primary key:", e?.message || e);
+    }
+  }
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_kv_key_global ON app_kv (key) WHERE admin_id IS NULL`
+  );
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_app_kv_user_key ON app_kv (admin_id, key) WHERE admin_id IS NOT NULL`
+  );
+
   // admin + filial kesimida bir xil normalizatsiyalangan ism takrorlanmasin.
   // Oldindan dublikatlar bo'lsa migratsiya yiqilmasligi uchun avval tekshiramiz.
   const dupEmpName = await pool.query(
@@ -252,183 +273,6 @@ export async function initSchema() {
     await pool.query(`ALTER TABLE role_salaries DROP CONSTRAINT IF EXISTS role_salaries_pkey`);
     await pool.query(`ALTER TABLE role_salaries ADD CONSTRAINT role_salaries_pkey PRIMARY KEY (admin_id, role_name)`);
   }
-}
-
-/** app_kv PK ustunlari (process bo‘yicha kesh). Migratsiya tugagach invalidate qilinadi. */
-let appKvPkColumnsCache = null;
-
-export function invalidateAppKvPkCache() {
-  appKvPkColumnsCache = null;
-}
-
-/**
- * app_kv: avvalgi global (faqat key PK) holatni har bir admin/superadmin uchun (admin_id, key) ga o‘tkazadi.
- * ensureDefaultAdmin() dan keyin chaqirilishi kerak — users jadvalida kamida bitta foydalanuvchi bo‘lganda.
- */
-export async function migrateAppKvPerAdmin(pool) {
-  console.log("[db] app_kv: server ishga tushishi bilan migratsiya tekshirilmoqda…");
-  const client = await pool.connect();
-  try {
-    const pkCols = await client.query(`
-      SELECT a.attname AS column_name
-      FROM pg_constraint c
-      JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
-      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
-      WHERE c.conrelid = 'app_kv'::regclass AND c.contype = 'p'
-      ORDER BY u.ord
-    `);
-    const cols = pkCols.rows.map((r) => r.column_name);
-    const pkSig = cols.join(",");
-    if (cols.length === 0) {
-      console.warn("[db] app_kv: primary key topilmadi — migratsiya o‘tkazilmadi.");
-      return;
-    }
-    if (pkSig === "admin_id,key" || pkSig === "key,admin_id") {
-      console.log("[db] app_kv: migratsiya kerak emas (har bir admin uchun PK allaqachon mavjud).");
-      return;
-    }
-    if (pkSig !== "key") {
-      console.warn("[db] app_kv: kutilmagan primary key:", cols);
-      return;
-    }
-
-    console.log("[db] app_kv: eski global sxema (faqat key) topildi — avtomatik migratsiya boshlandi…");
-    await client.query("BEGIN");
-
-    const pkr = await client.query(`
-      SELECT c.conname
-      FROM pg_constraint c
-      JOIN pg_class t ON t.oid = c.conrelid
-      WHERE t.relname = 'app_kv' AND c.contype = 'p'
-      LIMIT 1
-    `);
-    const pkeyName = pkr.rows[0]?.conname;
-    if (pkeyName) {
-      await client.query(`ALTER TABLE app_kv DROP CONSTRAINT ${quoteIdentPg(pkeyName)}`);
-    }
-
-    await client.query(`
-      INSERT INTO app_kv (admin_id, key, value)
-      SELECT u.id, g.key, g.value
-      FROM users u
-      CROSS JOIN (SELECT key, value FROM app_kv WHERE admin_id IS NULL) AS g
-      WHERE u.role IN ('admin', 'superadmin')
-        AND NOT EXISTS (
-          SELECT 1 FROM app_kv e WHERE e.admin_id = u.id AND e.key = g.key
-        )
-    `);
-
-    await client.query(`DELETE FROM app_kv WHERE admin_id IS NULL`);
-
-    await client.query(`ALTER TABLE app_kv ALTER COLUMN admin_id SET NOT NULL`);
-
-    await client.query(`
-      ALTER TABLE app_kv
-      ADD CONSTRAINT app_kv_admin_id_fkey FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE CASCADE
-    `).catch(() => {});
-
-    await client.query(`ALTER TABLE app_kv ADD PRIMARY KEY (admin_id, key)`);
-
-    await client.query("COMMIT");
-    invalidateAppKvPkCache();
-    console.log("[db] app_kv: har bir admin uchun (admin_id, key) ga migratsiya qilindi");
-  } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      /* ignore */
-    }
-    console.error("[db] migrateAppKvPerAdmin:", e?.message || e);
-  } finally {
-    client.release();
-  }
-}
-
-function quoteIdentPg(name) {
-  const s = String(name || "").replace(/"/g, '""');
-  return `"${s}"`;
-}
-
-async function getAppKvPkColumns(pool) {
-  if (appKvPkColumnsCache != null) return appKvPkColumnsCache;
-  const r = await pool.query(`
-    SELECT a.attname AS column_name
-    FROM pg_constraint c
-    JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
-    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
-    WHERE c.conrelid = 'app_kv'::regclass AND c.contype = 'p'
-    ORDER BY u.ord
-  `);
-  const cols = r.rows.map((x) => x.column_name);
-  if (cols.length > 0) appKvPkColumnsCache = cols;
-  return cols;
-}
-
-function pkColumnsAreComposite(cols) {
-  const s = new Set(cols || []);
-  return s.has("admin_id") && s.has("key");
-}
-
-function pkColumnsAreKeyOnly(cols) {
-  return Array.isArray(cols) && cols.length === 1 && cols[0] === "key";
-}
-
-/**
- * app_kv: PK sxemasiga qarab duplicate xatosiz yozish.
- * - composite (admin_id, key): shu juftlikni o‘chirib qayta INSERT.
- * - faqat key: bir xil key bo‘yicha bitta qator — DELETE + INSERT (eski global sxema).
- */
-export async function upsertAppKvRow(pool, adminId, key, value) {
-  const aid = Number(adminId);
-  if (!Number.isFinite(aid)) {
-    throw new Error("app_kv: admin_id noto'g'ri");
-  }
-  const v = String(value);
-  const cols = await getAppKvPkColumns(pool);
-
-  if (pkColumnsAreComposite(cols)) {
-    const c = await pool.connect();
-    try {
-      await c.query("BEGIN");
-      await c.query(`DELETE FROM app_kv WHERE admin_id = $1 AND key = $2`, [aid, key]);
-      await c.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
-      await c.query("COMMIT");
-    } catch (e) {
-      try {
-        await c.query("ROLLBACK");
-      } catch {
-        /* ignore */
-      }
-      throw e;
-    } finally {
-      c.release();
-    }
-    return;
-  }
-
-  if (pkColumnsAreKeyOnly(cols)) {
-    const c = await pool.connect();
-    try {
-      await c.query("BEGIN");
-      await c.query(`DELETE FROM app_kv WHERE key = $1`, [key]);
-      await c.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
-      await c.query("COMMIT");
-    } catch (e) {
-      try {
-        await c.query("ROLLBACK");
-      } catch {
-        /* ignore */
-      }
-      throw e;
-    } finally {
-      c.release();
-    }
-    return;
-  }
-
-  const r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [aid, key, v]);
-  if (r.rowCount > 0) return;
-  await pool.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
 }
 
 export { pool };
