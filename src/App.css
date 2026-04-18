@@ -142,6 +142,94 @@ html::-webkit-scrollbar-corner {
   background: transparent;
 }
 
+/**
+ * Vertikal skroll asosan o‘ng ustundagi `main.content` da (va sidebar alohida).
+ * html darajasidagi ortiqcha track yashirinadi; ichki jadvallarda vertikal
+ * skroll (gorizontal jadvaldan tashqari) asosiy kontentga ko‘chiriladi.
+ * Skroll «tugma»lari asosan hover/focus paytida ko‘rinadi — bo‘sh joyni buzmaydi.
+ */
+@media (min-width: 901px) {
+  html:has(.page > aside.sidebar) {
+    overflow: hidden;
+    scrollbar-width: none;
+  }
+
+  html:has(.page > aside.sidebar)::-webkit-scrollbar {
+    width: 0 !important;
+    height: 0 !important;
+  }
+}
+
+.page.ui-dense > main.content.scroll-modern,
+.page.ui-dense > aside.sidebar.scroll-modern {
+  scrollbar-color: transparent transparent;
+}
+
+.page.ui-dense > main.content.scroll-modern:hover,
+.page.ui-dense > main.content.scroll-modern:focus-within,
+.page.ui-dense > aside.sidebar.scroll-modern:hover,
+.page.ui-dense > aside.sidebar.scroll-modern:focus-within {
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+.page.ui-dense > main.content.scroll-modern::-webkit-scrollbar-thumb,
+.page.ui-dense > aside.sidebar.scroll-modern::-webkit-scrollbar-thumb {
+  transition: background 0.2s ease;
+}
+
+.page.ui-dense > main.content.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-thumb,
+.page.ui-dense > aside.sidebar.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+.page.ui-dense > main.content.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-track,
+.page.ui-dense > aside.sidebar.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (min-width: 901px) {
+  .page.ui-dense .table-wrap.scroll-modern {
+    overflow-y: visible;
+  }
+
+  .page.ui-dense .table-wrap.scroll-modern::-webkit-scrollbar {
+    height: 7px;
+    width: 0;
+  }
+
+  .page.ui-dense .salary-breakdown-row.scroll-modern {
+    overflow-y: visible;
+  }
+
+  .page.ui-dense .salary-breakdown-row.scroll-modern::-webkit-scrollbar {
+    height: 7px;
+    width: 0;
+  }
+
+  .page.ui-dense .table-wrap.baza-panel {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .page.ui-dense .table-wrap.baza-panel .db-table {
+    flex: 0 1 auto;
+    max-height: none !important;
+    overflow-y: visible;
+    overflow-x: auto;
+  }
+
+  .page.ui-dense .notice-history-list {
+    max-height: none;
+    overflow-y: visible;
+    padding-right: 0;
+  }
+
+  .page.ui-dense .report-detail-list {
+    max-height: none;
+    overflow-y: visible;
+  }
+}
+
 .page {
   width: 100%;
   max-width: none;
