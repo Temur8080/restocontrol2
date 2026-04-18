@@ -341,12 +341,39 @@ function quoteIdentPg(name) {
   return `"${s}"`;
 }
 
-/** app_kv: ON CONFLICT (admin_id, key) ba’zi DB larda unique bo‘lmasa xato beradi — UPDATE+INSERT ishonchli. */
+/**
+ * app_kv yozuvi: avvalo (admin_id, key), keyin global qoldiq (admin_id NULL, eski sxema).
+ * INSERT duplicate (app_kv_pkey) bo‘lsa — bir xil key bo‘yicha mavjud qatorni yangilaymiz.
+ */
 export async function upsertAppKvRow(pool, adminId, key, value) {
+  const aid = Number(adminId);
+  if (!Number.isFinite(aid)) {
+    throw new Error("app_kv: admin_id noto'g'ri");
+  }
   const v = String(value);
-  const r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [adminId, key, v]);
+  let r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [aid, key, v]);
   if (r.rowCount > 0) return;
-  await pool.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [adminId, key, v]);
+
+  r = await pool.query(
+    `UPDATE app_kv SET admin_id = $1, value = $3 WHERE key = $2 AND admin_id IS NULL`,
+    [aid, key, v]
+  );
+  if (r.rowCount > 0) return;
+
+  try {
+    await pool.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
+  } catch (e) {
+    if (e && e.code === "23505") {
+      r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [aid, key, v]);
+      if (r.rowCount > 0) return;
+      r = await pool.query(
+        `UPDATE app_kv SET admin_id = $1, value = $3 WHERE key = $2 AND admin_id IS NULL`,
+        [aid, key, v]
+      );
+      if (r.rowCount > 0) return;
+    }
+    throw e;
+  }
 }
 
 export { pool };
