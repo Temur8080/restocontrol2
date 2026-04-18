@@ -43,6 +43,7 @@ import {
   X,
 } from "lucide-react";
 import ExcelJS from "exceljs";
+import { useScrollModernReveal } from "./useScrollModernReveal.js";
 
 const menuItems = ["Dashboard", "Hodimlar", "Hisobot", "Sozlamalar"];
 const DEFAULT_ACTIVE_MENU = "Dashboard";
@@ -1399,6 +1400,8 @@ function App() {
     setMassPayBusy(false);
     setMassPayError("");
   }, []);
+
+  useScrollModernReveal();
 
   useEffect(() => {
     if (!attendanceHistoryLightbox) return undefined;
@@ -4624,8 +4627,9 @@ function App() {
         </div>
       </aside>
 
+      <div className="page-main-scroll scroll-modern">
       <main
-        className={`content scroll-modern${
+        className={`content${
           activeMenu === "Hodimlar"
             ? " content-view-hodimlar"
             : activeMenu === "Hisobot"
@@ -5594,7 +5598,7 @@ function App() {
             <section
               className={
                 activeMenu === "Sozlamalar"
-                  ? "settings-min-page journal-wrap scroll-modern"
+                  ? "settings-min-page journal-wrap"
                   : "journal-wrap module-placeholder"
               }
             >
@@ -6585,6 +6589,7 @@ function App() {
           )
         ) : null}
       </main>
+      </div>
 
       <nav className="mobile-bottom-nav" aria-label={t("common.mobileMainNav")}>
         {sidebarMenuItems.map((item) => {

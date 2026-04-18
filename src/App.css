@@ -105,14 +105,15 @@ html::-webkit-scrollbar-corner {
   background: transparent;
 }
 
+/* Scrollbar: tinch paytda ko‘rinmaydi; aylanish paytida .scroll-modern--reveal (JS) bilan chiqadi */
 .scroll-modern {
   scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-color: transparent transparent;
   -webkit-overflow-scrolling: touch;
 }
 
-.scroll-modern:hover {
-  scrollbar-color: var(--scrollbar-thumb-hover) var(--scrollbar-track);
+.scroll-modern.scroll-modern--reveal {
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
 }
 
 .scroll-modern::-webkit-scrollbar {
@@ -121,112 +122,51 @@ html::-webkit-scrollbar-corner {
 }
 
 .scroll-modern::-webkit-scrollbar-track {
-  background: var(--scrollbar-track);
+  background: transparent;
   border-radius: var(--scrollbar-radius);
   margin: 3px;
+  transition: background 0.35s ease;
+}
+
+.scroll-modern.scroll-modern--reveal::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
 }
 
 .scroll-modern::-webkit-scrollbar-thumb {
-  background: var(--scrollbar-thumb);
+  background: transparent;
   border-radius: var(--scrollbar-radius);
   border: 2px solid transparent;
   background-clip: padding-box;
-  transition: background-color 0.18s ease, transform 0.15s ease;
+  transition: background-color 0.4s ease;
 }
 
-.scroll-modern::-webkit-scrollbar-thumb:hover {
-  background: var(--scrollbar-thumb-hover);
+.scroll-modern.scroll-modern--reveal::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+}
+
+.scroll-modern.scroll-modern--reveal::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
 }
 
 .scroll-modern::-webkit-scrollbar-corner {
   background: transparent;
 }
 
-/**
- * Vertikal skroll asosan o‘ng ustundagi `main.content` da (va sidebar alohida).
- * html darajasidagi ortiqcha track yashirinadi; ichki jadvallarda vertikal
- * skroll (gorizontal jadvaldan tashqari) asosiy kontentga ko‘chiriladi.
- * Skroll «tugma»lari asosan hover/focus paytida ko‘rinadi — bo‘sh joyni buzmaydi.
- */
-@media (min-width: 901px) {
-  html:has(.page > aside.sidebar) {
-    overflow: hidden;
-    scrollbar-width: none;
+@media (prefers-reduced-motion: reduce) {
+  .scroll-modern {
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
   }
 
-  html:has(.page > aside.sidebar)::-webkit-scrollbar {
-    width: 0 !important;
-    height: 0 !important;
-  }
-}
-
-.page.ui-dense > main.content.scroll-modern,
-.page.ui-dense > aside.sidebar.scroll-modern {
-  scrollbar-color: transparent transparent;
-}
-
-.page.ui-dense > main.content.scroll-modern:hover,
-.page.ui-dense > main.content.scroll-modern:focus-within,
-.page.ui-dense > aside.sidebar.scroll-modern:hover,
-.page.ui-dense > aside.sidebar.scroll-modern:focus-within {
-  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
-}
-
-.page.ui-dense > main.content.scroll-modern::-webkit-scrollbar-thumb,
-.page.ui-dense > aside.sidebar.scroll-modern::-webkit-scrollbar-thumb {
-  transition: background 0.2s ease;
-}
-
-.page.ui-dense > main.content.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-thumb,
-.page.ui-dense > aside.sidebar.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-thumb {
-  background: transparent;
-}
-
-.page.ui-dense > main.content.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-track,
-.page.ui-dense > aside.sidebar.scroll-modern:not(:hover):not(:focus-within)::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-@media (min-width: 901px) {
-  .page.ui-dense .table-wrap.scroll-modern {
-    overflow-y: visible;
+  .scroll-modern::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
   }
 
-  .page.ui-dense .table-wrap.scroll-modern::-webkit-scrollbar {
-    height: 7px;
-    width: 0;
+  .scroll-modern::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar-thumb);
   }
 
-  .page.ui-dense .salary-breakdown-row.scroll-modern {
-    overflow-y: visible;
-  }
-
-  .page.ui-dense .salary-breakdown-row.scroll-modern::-webkit-scrollbar {
-    height: 7px;
-    width: 0;
-  }
-
-  .page.ui-dense .table-wrap.baza-panel {
-    max-height: none;
-    overflow: visible;
-  }
-
-  .page.ui-dense .table-wrap.baza-panel .db-table {
-    flex: 0 1 auto;
-    max-height: none !important;
-    overflow-y: visible;
-    overflow-x: auto;
-  }
-
-  .page.ui-dense .notice-history-list {
-    max-height: none;
-    overflow-y: visible;
-    padding-right: 0;
-  }
-
-  .page.ui-dense .report-detail-list {
-    max-height: none;
-    overflow-y: visible;
+  .scroll-modern::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scrollbar-thumb-hover);
   }
 }
 
@@ -273,11 +213,21 @@ html::-webkit-scrollbar-corner {
     overflow-y: auto;
   }
 
-  .page:has(> aside.sidebar) > main.content {
+  /* Asosiy kontent scrolli: o‘ng ustun, scrollbar tema — scroll-modern bu qobiqda */
+  .page:has(> aside.sidebar) > .page-main-scroll {
     min-height: 0;
+    align-self: stretch;
     overflow-x: hidden;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
+}
+
+/* Vertikal scroll konteyneri (desktop + mobil); ichki `.content` kartasi tartibi o‘zgarmaydi */
+.page-main-scroll {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .sidebar {
@@ -3578,17 +3528,7 @@ tr.employee-row-attendance:hover td {
   flex: 1;
 }
 
-.content:has(.settings-min-page) {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.content:has(.settings-min-page) > .settings-min-page {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-}
+/* Sozlamalar: vertikal scroll faqat .page-main-scroll da (ichki ikkinchi scroll yo‘q). */
 
 .dashboard-hero {
   border: 1px solid var(--rc-border);
@@ -5879,7 +5819,7 @@ td {
     min-height: 100svh;
   }
 
-  .page > main.content {
+  .page > .page-main-scroll {
     min-height: 0;
     overflow-x: hidden;
     overflow-y: auto;
@@ -5902,7 +5842,7 @@ td {
     padding: clamp(8px, 3.2vw, 14px) clamp(9px, 3.6vw, 16px);
     padding-bottom: calc(clamp(76px, 21vw, 92px) + env(safe-area-inset-bottom, 0));
     min-height: 0;
-    flex: 1;
+    flex: 0 1 auto;
     background: var(--rc-page-bg);
   }
 
