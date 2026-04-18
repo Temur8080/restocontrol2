@@ -254,6 +254,13 @@ export async function initSchema() {
   }
 }
 
+/** app_kv PK ustunlari (process bo‘yicha kesh). Migratsiya tugagach invalidate qilinadi. */
+let appKvPkColumnsCache = null;
+
+export function invalidateAppKvPkCache() {
+  appKvPkColumnsCache = null;
+}
+
 /**
  * app_kv: avvalgi global (faqat key PK) holatni har bir admin/superadmin uchun (admin_id, key) ga o‘tkazadi.
  * ensureDefaultAdmin() dan keyin chaqirilishi kerak — users jadvalida kamida bitta foydalanuvchi bo‘lganda.
@@ -323,6 +330,7 @@ export async function migrateAppKvPerAdmin(pool) {
     await client.query(`ALTER TABLE app_kv ADD PRIMARY KEY (admin_id, key)`);
 
     await client.query("COMMIT");
+    invalidateAppKvPkCache();
     console.log("[db] app_kv: har bir admin uchun (admin_id, key) ga migratsiya qilindi");
   } catch (e) {
     try {
@@ -341,9 +349,34 @@ function quoteIdentPg(name) {
   return `"${s}"`;
 }
 
+async function getAppKvPkColumns(pool) {
+  if (appKvPkColumnsCache != null) return appKvPkColumnsCache;
+  const r = await pool.query(`
+    SELECT a.attname AS column_name
+    FROM pg_constraint c
+    JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
+    WHERE c.conrelid = 'app_kv'::regclass AND c.contype = 'p'
+    ORDER BY u.ord
+  `);
+  const cols = r.rows.map((x) => x.column_name);
+  if (cols.length > 0) appKvPkColumnsCache = cols;
+  return cols;
+}
+
+function pkColumnsAreComposite(cols) {
+  const s = new Set(cols || []);
+  return s.has("admin_id") && s.has("key");
+}
+
+function pkColumnsAreKeyOnly(cols) {
+  return Array.isArray(cols) && cols.length === 1 && cols[0] === "key";
+}
+
 /**
- * app_kv yozuvi: avvalo (admin_id, key), keyin global qoldiq (admin_id NULL, eski sxema).
- * INSERT duplicate (app_kv_pkey) bo‘lsa — bir xil key bo‘yicha mavjud qatorni yangilaymiz.
+ * app_kv: PK sxemasiga qarab duplicate xatosiz yozish.
+ * - composite (admin_id, key): shu juftlikni o‘chirib qayta INSERT.
+ * - faqat key: bir xil key bo‘yicha bitta qator — DELETE + INSERT (eski global sxema).
  */
 export async function upsertAppKvRow(pool, adminId, key, value) {
   const aid = Number(adminId);
@@ -351,29 +384,51 @@ export async function upsertAppKvRow(pool, adminId, key, value) {
     throw new Error("app_kv: admin_id noto'g'ri");
   }
   const v = String(value);
-  let r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [aid, key, v]);
-  if (r.rowCount > 0) return;
+  const cols = await getAppKvPkColumns(pool);
 
-  r = await pool.query(
-    `UPDATE app_kv SET admin_id = $1, value = $3 WHERE key = $2 AND admin_id IS NULL`,
-    [aid, key, v]
-  );
-  if (r.rowCount > 0) return;
-
-  try {
-    await pool.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
-  } catch (e) {
-    if (e && e.code === "23505") {
-      r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [aid, key, v]);
-      if (r.rowCount > 0) return;
-      r = await pool.query(
-        `UPDATE app_kv SET admin_id = $1, value = $3 WHERE key = $2 AND admin_id IS NULL`,
-        [aid, key, v]
-      );
-      if (r.rowCount > 0) return;
+  if (pkColumnsAreComposite(cols)) {
+    const c = await pool.connect();
+    try {
+      await c.query("BEGIN");
+      await c.query(`DELETE FROM app_kv WHERE admin_id = $1 AND key = $2`, [aid, key]);
+      await c.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
+      await c.query("COMMIT");
+    } catch (e) {
+      try {
+        await c.query("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    } finally {
+      c.release();
     }
-    throw e;
+    return;
   }
+
+  if (pkColumnsAreKeyOnly(cols)) {
+    const c = await pool.connect();
+    try {
+      await c.query("BEGIN");
+      await c.query(`DELETE FROM app_kv WHERE key = $1`, [key]);
+      await c.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
+      await c.query("COMMIT");
+    } catch (e) {
+      try {
+        await c.query("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    } finally {
+      c.release();
+    }
+    return;
+  }
+
+  const r = await pool.query(`UPDATE app_kv SET value = $3 WHERE admin_id = $1 AND key = $2`, [aid, key, v]);
+  if (r.rowCount > 0) return;
+  await pool.query(`INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)`, [aid, key, v]);
 }
 
 export { pool };
