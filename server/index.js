@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
-import { pool, initSchema } from "./db.js";
+import { pool, initSchema, migrateAppKvPerAdmin } from "./db.js";
 import { authMiddleware, signToken, assertJwtConfigured } from "./auth.js";
 import { ensureDefaultAdmin } from "./seed-admin.js";
 import { probeHikvisionTerminal } from "./terminalProbe.js";
@@ -1454,28 +1454,52 @@ api.get("/bootstrap", async (req, res) => {
 
     let scopedAdminId = null;
     if (userRole === "admin") scopedAdminId = authSub;
+
+    /** Sozlamalar (theme, salary policy, default calc) — har bir admin o‘z qatorlarida. */
+    let settingsAdminId = null;
+    if (userRole === "admin" || userRole === "superadmin") {
+      settingsAdminId = authSub;
+    } else if (userRole === "hodim") {
+      if (!myEmployeeId) {
+        return res.status(400).json({ error: "Hodim uchun employee_id bog'lanmagan" });
+      }
+      const sa = await pool.query(`SELECT admin_id FROM employees WHERE id = $1`, [myEmployeeId]);
+      settingsAdminId = sa.rows[0]?.admin_id ?? null;
+    }
+
     let roleSalariesQ;
-    const themeQ = pool.query(`SELECT value FROM app_kv WHERE key = 'theme'`);
-    const salaryCalcQ = pool.query(
-      `SELECT key, value FROM app_kv WHERE key IN
+    const emptyKv = Promise.resolve({ rows: [] });
+    const themeQ =
+      settingsAdminId != null
+        ? pool.query(`SELECT value FROM app_kv WHERE admin_id = $1 AND key = 'theme'`, [settingsAdminId])
+        : emptyKv;
+    const salaryCalcQ =
+      settingsAdminId != null
+        ? pool.query(
+            `SELECT key, value FROM app_kv WHERE admin_id = $1 AND key IN
        ('salary_calc_week_mode','salary_calc_week_fixed','salary_calc_month_mode','salary_calc_month_fixed',
         'salary_calc_attendance_mode',
         'terminal_event_timezone_offset_hours',
         'salary_policy_enabled',
         'salary_policy_late_per_minute','salary_policy_bonus_per_minute','salary_policy_bonus_grace_minutes',
         'salary_policy_late_grace_minutes','salary_policy_max_daily_fine',
-        'salary_policy_employee_overrides')`
-    );
-    const adminSalaryCalcQ = pool.query(
-      `SELECT filial, week_mode, week_fixed, month_mode, month_fixed, attendance_mode
+        'salary_policy_employee_overrides')`,
+            [settingsAdminId]
+          )
+        : emptyKv;
+    const adminSalaryCalcQ =
+      settingsAdminId != null
+        ? pool.query(
+            `SELECT filial, week_mode, week_fixed, month_mode, month_fixed, attendance_mode
        FROM admin_salary_calc_configs
        WHERE admin_id = $1`,
-      [authSub]
-    );
-    const adminFilialsQ = pool.query(
-      `SELECT filial FROM admin_filial_map WHERE admin_id = $1 ORDER BY filial ASC`,
-      [authSub]
-    );
+            [settingsAdminId]
+          )
+        : emptyKv;
+    const adminFilialsQ =
+      settingsAdminId != null
+        ? pool.query(`SELECT filial FROM admin_filial_map WHERE admin_id = $1 ORDER BY filial ASC`, [settingsAdminId])
+        : emptyKv;
 
     let adminSubscription = null;
     let adminSubscriptionMessage = "";
@@ -1514,9 +1538,6 @@ api.get("/bootstrap", async (req, res) => {
     let adjR;
 
     if (userRole === "hodim") {
-      if (!myEmployeeId) {
-        return res.status(400).json({ error: "Hodim uchun employee_id bog'lanmagan" });
-      }
       empR = await pool.query(
         `SELECT id, admin_id, name, role, filial, shift_start, shift_end, weekly_schedule, access_card_no FROM employees WHERE id = $1`,
         [myEmployeeId]
@@ -2174,14 +2195,20 @@ api.delete("/salary/adjustments/:id", async (req, res) => {
 
 api.put("/settings/theme", async (req, res) => {
   try {
+    const role = req.auth?.role;
+    if (role !== "admin" && role !== "superadmin") {
+      return res.status(403).json({ error: "Faqat admin" });
+    }
+    const uid = req.auth?.sub;
+    if (uid == null) return res.status(401).json({ error: "Sessiya xatosi" });
     const theme = req.body?.theme;
     if (theme !== "light" && theme !== "dark") {
       return res.status(400).json({ error: "theme: light yoki dark" });
     }
     await pool.query(
-      `INSERT INTO app_kv (key, value) VALUES ('theme', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [theme]
+      `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, 'theme', $2)
+       ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [uid, theme]
     );
     res.status(204).send();
   } catch (err) {
@@ -2225,11 +2252,13 @@ api.put("/settings/salary-policy", async (req, res) => {
       ["salary_policy_max_daily_fine", String(maxDailyFine)],
       ["salary_policy_employee_overrides", JSON.stringify(employeeOverrides)],
     ];
+    const uid = req.auth?.sub;
+    if (uid == null) return res.status(403).json({ error: "Sessiya xatosi" });
     for (const [key, value] of items) {
       await pool.query(
-        `INSERT INTO app_kv (key, value) VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [key, value]
+        `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)
+         ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [uid, key, value]
       );
     }
     res.status(204).send();
@@ -2266,11 +2295,13 @@ api.put("/settings/salary-calc", async (req, res) => {
       ["salary_calc_attendance_mode", attendanceMode],
     ];
 
+    const uid = req.auth?.sub;
+    if (uid == null) return res.status(403).json({ error: "Sessiya xatosi" });
     for (const [key, value] of items) {
       await pool.query(
-        `INSERT INTO app_kv (key, value) VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [key, value]
+        `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)
+         ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [uid, key, value]
       );
     }
     res.status(204).send();
@@ -2329,12 +2360,14 @@ api.put("/settings/terminal-timezone", async (req, res) => {
   try {
     const ok = await requireActiveAdminOrSuperadmin(req, res);
     if (!ok) return;
+    const uid = req.auth?.sub;
+    if (uid == null) return res.status(403).json({ error: "Sessiya xatosi" });
     const raw = Number(req.body?.offsetHours);
     const safe = Number.isFinite(raw) ? Math.max(-12, Math.min(14, raw)) : 5;
     await pool.query(
-      `INSERT INTO app_kv (key, value) VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      ["terminal_event_timezone_offset_hours", String(safe)]
+      `INSERT INTO app_kv (admin_id, key, value) VALUES ($1, $2, $3)
+       ON CONFLICT (admin_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [uid, "terminal_event_timezone_offset_hours", String(safe)]
     );
     res.status(204).send();
   } catch (err) {
@@ -2364,6 +2397,7 @@ async function main() {
   await initSchema();
   assertJwtConfigured();
   await ensureDefaultAdmin();
+  await migrateAppKvPerAdmin(pool);
 
   const { broadcast, attachToHttpServer } = createAttendanceBroadcaster(pool);
   setAttendanceBroadcastHub(broadcast);

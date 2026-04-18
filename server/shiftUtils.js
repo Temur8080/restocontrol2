@@ -58,10 +58,12 @@ export function computeCheckInLateFlag(row, recordDate, checkInHHMM, graceMinute
   return cin > st + g;
 }
 
-export async function fetchGlobalLateGraceMinutes(pool) {
+async function fetchLateGraceFallbackForAdmin(pool, adminId) {
+  if (adminId == null || !Number.isFinite(Number(adminId))) return 5;
   try {
     const { rows } = await pool.query(
-      `SELECT value FROM app_kv WHERE key = 'salary_policy_late_grace_minutes' ORDER BY admin_id NULLS FIRST LIMIT 1`
+      `SELECT value FROM app_kv WHERE admin_id = $1 AND key = 'salary_policy_late_grace_minutes' LIMIT 1`,
+      [adminId]
     );
     const n = Number(rows[0]?.value);
     if (Number.isFinite(n)) return Math.max(0, Math.trunc(n));
@@ -71,12 +73,21 @@ export async function fetchGlobalLateGraceMinutes(pool) {
   return 5;
 }
 
-/** Hodim bo‘yicha kechikish «sabr» daqiqalari (global + salary_policy_employee_overrides). */
+/** Hodim bo‘yicha kechikish «sabr» daqiqalari (admin sozlamalari + salary_policy_employee_overrides). */
 export async function fetchLateGraceForEmployee(pool, employeeId) {
-  const fallback = await fetchGlobalLateGraceMinutes(pool);
+  let adminId = null;
   try {
+    const { rows } = await pool.query(`SELECT admin_id FROM employees WHERE id = $1`, [employeeId]);
+    adminId = rows[0]?.admin_id ?? null;
+  } catch {
+    /* ignore */
+  }
+  const fallback = await fetchLateGraceFallbackForAdmin(pool, adminId);
+  try {
+    if (adminId == null) return fallback;
     const { rows } = await pool.query(
-      `SELECT value FROM app_kv WHERE key = 'salary_policy_employee_overrides' ORDER BY admin_id NULLS FIRST LIMIT 1`
+      `SELECT value FROM app_kv WHERE admin_id = $1 AND key = 'salary_policy_employee_overrides' LIMIT 1`,
+      [adminId]
     );
     const raw = rows[0]?.value;
     if (raw == null || String(raw).trim() === "") return fallback;

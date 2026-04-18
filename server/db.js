@@ -254,4 +254,84 @@ export async function initSchema() {
   }
 }
 
+/**
+ * app_kv: avvalgi global (faqat key PK) holatni har bir admin/superadmin uchun (admin_id, key) ga o‘tkazadi.
+ * ensureDefaultAdmin() dan keyin chaqirilishi kerak — users jadvalida kamida bitta foydalanuvchi bo‘lganda.
+ */
+export async function migrateAppKvPerAdmin(pool) {
+  const client = await pool.connect();
+  try {
+    const tc = await client.query(`
+      SELECT kcu.column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+      WHERE tc.table_name = 'app_kv' AND tc.table_schema = 'public' AND tc.constraint_type = 'PRIMARY KEY'
+      ORDER BY kcu.ordinal_position
+    `);
+    const cols = tc.rows.map((r) => r.column_name);
+    const pkSig = cols.join(",");
+    if (pkSig === "admin_id,key" || pkSig === "key,admin_id") {
+      return;
+    }
+    if (pkSig !== "key") {
+      console.warn("[db] app_kv: kutilmagan primary key:", cols);
+      return;
+    }
+
+    await client.query("BEGIN");
+
+    const pkr = await client.query(`
+      SELECT c.conname
+      FROM pg_constraint c
+      JOIN pg_class t ON t.oid = c.conrelid
+      WHERE t.relname = 'app_kv' AND c.contype = 'p'
+      LIMIT 1
+    `);
+    const pkeyName = pkr.rows[0]?.conname;
+    if (pkeyName) {
+      await client.query(`ALTER TABLE app_kv DROP CONSTRAINT ${quoteIdentPg(pkeyName)}`);
+    }
+
+    await client.query(`
+      INSERT INTO app_kv (admin_id, key, value)
+      SELECT u.id, g.key, g.value
+      FROM users u
+      CROSS JOIN (SELECT key, value FROM app_kv WHERE admin_id IS NULL) AS g
+      WHERE u.role IN ('admin', 'superadmin')
+        AND NOT EXISTS (
+          SELECT 1 FROM app_kv e WHERE e.admin_id = u.id AND e.key = g.key
+        )
+    `);
+
+    await client.query(`DELETE FROM app_kv WHERE admin_id IS NULL`);
+
+    await client.query(`ALTER TABLE app_kv ALTER COLUMN admin_id SET NOT NULL`);
+
+    await client.query(`
+      ALTER TABLE app_kv
+      ADD CONSTRAINT app_kv_admin_id_fkey FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE CASCADE
+    `).catch(() => {});
+
+    await client.query(`ALTER TABLE app_kv ADD PRIMARY KEY (admin_id, key)`);
+
+    await client.query("COMMIT");
+    console.log("[db] app_kv: har bir admin uchun (admin_id, key) ga migratsiya qilindi");
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    console.error("[db] migrateAppKvPerAdmin:", e?.message || e);
+  } finally {
+    client.release();
+  }
+}
+
+function quoteIdentPg(name) {
+  const s = String(name || "").replace(/"/g, '""');
+  return `"${s}"`;
+}
+
 export { pool };
