@@ -304,6 +304,53 @@ function toMinutes(time) {
   return h * 60 + min;
 }
 
+/** Bir xil kalendar HH:MM da: smena tugashi boshlanishdan kichik bo‘lsa — ertasi tong (masalan 09:00–01:00). */
+function shiftSpansMidnight(startStr, endStr) {
+  const sm = toMinutes(String(startStr ?? "").trim());
+  const em = toMinutes(String(endStr ?? "").trim());
+  return Number.isFinite(sm) && Number.isFinite(em) && em < sm;
+}
+
+/**
+ * Ketishni reja tugashi bilan solishtirish: overnight da tugash = 24*60+endM;
+ * tong soatlari (start dan oldin) ketish = keyingi kun qismi (+24 soat).
+ */
+function effectiveShiftEndAndCheckoutMinutes(startStr, endStr, checkoutMinutes) {
+  const startM = toMinutes(String(startStr ?? "").trim());
+  const endM = toMinutes(String(endStr ?? "").trim());
+  if (!Number.isFinite(startM) || !Number.isFinite(endM) || !Number.isFinite(checkoutMinutes)) {
+    return { overnight: false, endEff: endM, coEff: checkoutMinutes };
+  }
+  if (endM >= startM) {
+    return { overnight: false, endEff: endM, coEff: checkoutMinutes };
+  }
+  return {
+    overnight: true,
+    endEff: 24 * 60 + endM,
+    coEff: checkoutMinutes < startM ? checkoutMinutes + 24 * 60 : checkoutMinutes,
+  };
+}
+
+/** Bir kun ichidagi ketishlardan «eng oxirgi» ni tanlash (overnight: tong < start bo‘lsa +24 soat). */
+function checkoutMinutesForDayOrdering(startStr, endStr, checkoutHHMM) {
+  const coM = toMinutes(String(checkoutHHMM ?? "").trim());
+  if (!Number.isFinite(coM)) return NaN;
+  if (!shiftSpansMidnight(startStr, endStr)) return coM;
+  const startM = toMinutes(String(startStr ?? "").trim());
+  if (!Number.isFinite(startM)) return coM;
+  return coM < startM ? coM + 24 * 60 : coM;
+}
+
+/** Reja davomiyligi (daqiqa): overnight bo‘lsa 24 soat qo‘shiladi. */
+function scheduledShiftDurationMinutes(startStr, endStr) {
+  const startM = toMinutes(String(startStr ?? "").trim());
+  const endM = toMinutes(String(endStr ?? "").trim());
+  if (!Number.isFinite(startM) || !Number.isFinite(endM)) return 0;
+  let d = endM - startM;
+  if (d <= 0) d += 24 * 60;
+  return Math.max(0, d);
+}
+
 function getLateGraceMinutesFromPolicy(salaryPolicy) {
   const g = salaryPolicy?.lateGraceMinutes;
   if (Number.isFinite(Number(g))) return Math.max(0, Math.trunc(Number(g)));
@@ -357,17 +404,17 @@ function minCheckInAmongDayRecords(records) {
 }
 
 /** Kun uchun eng kech Ketdi vaqtini (mavjud bo‘lsa) qaytaradi. */
-function maxCheckOutAmongDayRecords(records) {
+function maxCheckOutAmongDayRecords(records, shiftStart, shiftEnd) {
   let best = "";
-  let bestM = NaN;
+  let bestKey = NaN;
   for (const r of records) {
     const s = r?.checkOut != null ? String(r.checkOut).trim() : "";
     if (!s) continue;
-    const m = toMinutes(s);
-    if (!Number.isFinite(m)) continue;
-    if (!best || m > bestM) {
+    const key = checkoutMinutesForDayOrdering(shiftStart, shiftEnd, s);
+    if (!Number.isFinite(key)) continue;
+    if (!best || key > bestKey) {
       best = s;
-      bestM = m;
+      bestKey = key;
     }
   }
   return best;
@@ -405,7 +452,7 @@ function getEmployeeAttendance(employee, records, date, lateGraceMinutes = 5) {
 
   const firstIn = minCheckInAmongDayRecords(sorted);
   const openSegment = findOpenDaySegment(sorted);
-  const lastOutClosed = maxCheckOutAmongDayRecords(sorted);
+  const lastOutClosed = maxCheckOutAmongDayRecords(sorted, shift.start, shift.end);
   const displayCheckOut = openSegment ? "" : lastOutClosed;
 
   const isLateNow = shift.work && firstIn !== "" && isLate(firstIn, shift.start, grace);
@@ -434,7 +481,6 @@ function attendanceCheckInOutFragments(employee, record, dateStr, lateGraceMinut
   const cin = String(record.checkIn).trim();
   const cinM = toMinutes(cin);
   const startM = toMinutes(sh.start);
-  const endM = toMinutes(sh.end);
   const lateAfterStart =
     sh.work && Number.isFinite(cinM) && Number.isFinite(startM) ? Math.max(0, cinM - startM) : 0;
   const earlyBeforeStart =
@@ -449,12 +495,15 @@ function attendanceCheckInOutFragments(employee, record, dateStr, lateGraceMinut
   let checkoutLateMin = 0;
   if (coRaw) {
     const coM = toMinutes(coRaw);
+    const { endEff, coEff } = effectiveShiftEndAndCheckoutMinutes(sh.start, sh.end, coM);
     const earlyMin =
-      sh.work && Number.isFinite(coM) && Number.isFinite(endM) && coM < endM ? Math.max(0, endM - coM) : 0;
+      sh.work && Number.isFinite(coEff) && Number.isFinite(endEff) && coEff < endEff
+        ? Math.max(0, endEff - coEff)
+        : 0;
     outEarly = earlyMin > 0;
     checkoutEarlyMin = earlyMin;
     const lateMin =
-      sh.work && Number.isFinite(coM) && Number.isFinite(endM) && coM > endM ? coM - endM : 0;
+      sh.work && Number.isFinite(coEff) && Number.isFinite(endEff) && coEff > endEff ? coEff - endEff : 0;
     outLate = lateMin > 0;
     checkoutLateMin = lateMin;
   }
@@ -719,9 +768,8 @@ function getEmployeeEarnedSalary(employee, dateStr, attendance, roleSalaries, ov
     const capHourlyToShift = salaryCalcConfig?.capHourlyToShift === true;
     let payableHours = hours;
     if (capHourlyToShift) {
-      const shiftStartMin = toMinutes(sh.start || "09:00");
-      const shiftEndMin = toMinutes(sh.end || "18:00");
-      const shiftHours = Math.max(0, shiftEndMin - shiftStartMin) / 60;
+      const shiftDurMin = scheduledShiftDurationMinutes(sh.start || "09:00", sh.end || "18:00");
+      const shiftHours = shiftDurMin / 60;
       payableHours = shiftHours > 0 ? Math.min(hours, shiftHours) : hours;
     }
     return Math.round((rate.amount || 0) * payableHours);
@@ -889,7 +937,9 @@ function getWorkedHoursOnDay(employee, dateStr, attendance, attendanceMode = "fi
       let endMin = row?.checkOut && String(row.checkOut).trim() ? toMinutes(String(row.checkOut).trim()) : toMinutes(sh.end);
       if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) continue;
       if (endMin <= startMin) endMin += 24 * 60;
-      if (!row?.checkOut || String(row.checkOut).trim() === "") endMin = Math.min(endMin, 23 * 60 + 59);
+      if (!row?.checkOut || String(row.checkOut).trim() === "") {
+        if (!shiftSpansMidnight(sh.start, sh.end)) endMin = Math.min(endMin, 23 * 60 + 59);
+      }
       totalMin += Math.max(0, endMin - startMin);
     }
     return Math.max(0, totalMin / 60);
@@ -903,7 +953,7 @@ function getWorkedHoursOnDay(employee, dateStr, attendance, attendanceMode = "fi
   if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) return 0;
   if (endMin <= startMin) endMin += 24 * 60;
   if (rawOut == null || String(rawOut).trim() === "") {
-    endMin = Math.min(endMin, 23 * 60 + 59);
+    if (!shiftSpansMidnight(sh.start, sh.end)) endMin = Math.min(endMin, 23 * 60 + 59);
   }
   return Math.max(0, (endMin - startMin) / 60);
 }
@@ -1061,9 +1111,7 @@ function computeHisobotTableRowMetrics(employee, ctx) {
       if (amount > 0) fineByDate.set(dateStr, (fineByDate.get(dateStr) || 0) + amount);
     }
     if (policyEnabled && att?.current?.checkIn && shift.work) {
-      const startMin = toMinutes(shift.start || "09:00");
-      const endMin = toMinutes(shift.end || "18:00");
-      const shiftDurMin = Math.max(0, endMin - startMin);
+      const shiftDurMin = scheduledShiftDurationMinutes(shift.start || "09:00", shift.end || "18:00");
       const workedMin = Math.round(getWorkedHoursOnDay(employee, dateStr, att, cfg?.attendanceMode) * 60);
       const grace = Number.isFinite(Number(empPolicy?.bonusGraceMinutes))
         ? Math.max(0, Math.trunc(Number(empPolicy.bonusGraceMinutes)))
@@ -2201,9 +2249,7 @@ function App() {
           fineMonth += Math.max(0, Math.trunc(amount || 0));
         }
         if (policyEnabled && att?.current?.checkIn && shift.work) {
-          const startMin = toMinutes(shift.start || "09:00");
-          const endMin = toMinutes(shift.end || "18:00");
-          const shiftDurMin = Math.max(0, endMin - startMin);
+          const shiftDurMin = scheduledShiftDurationMinutes(shift.start || "09:00", shift.end || "18:00");
           const workedMin = Math.round(getWorkedHoursOnDay(employee, dateStr, att, cfg?.attendanceMode) * 60);
           const grace = Number.isFinite(Number(empPolicy?.bonusGraceMinutes))
             ? Math.max(0, Math.trunc(Number(empPolicy.bonusGraceMinutes)))
@@ -2715,9 +2761,7 @@ function App() {
       }
       if (policyEnabled && att?.current?.checkIn) {
         if (shift?.work) {
-          const startMin = toMinutes(shift.start || "09:00");
-          const endMin = toMinutes(shift.end || "18:00");
-          const shiftDurMin = Math.max(0, endMin - startMin);
+          const shiftDurMin = scheduledShiftDurationMinutes(shift.start || "09:00", shift.end || "18:00");
           const workedMin = Math.round(
             getWorkedHoursOnDay(reportDetailEmployee, dateStr, att, cfg?.attendanceMode) * 60
           );
