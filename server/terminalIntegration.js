@@ -340,6 +340,34 @@ function buildCanonicalEmployeeKey(employeeId) {
   return `ID_A${String(employeeId)}`;
 }
 
+function parseTimeToMinutes(value) {
+  const s = String(value || "").trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const h = Number.parseInt(m[1], 10);
+  const mm = Number.parseInt(m[2], 10);
+  if (!Number.isFinite(h) || !Number.isFinite(mm)) return null;
+  if (h < 0 || h > 23 || mm < 0 || mm > 59) return null;
+  return h * 60 + mm;
+}
+
+function isOvernightShiftByRow(row) {
+  const start = parseTimeToMinutes(row?.shift_start);
+  const end = parseTimeToMinutes(row?.shift_end);
+  if (start == null || end == null) return false;
+  return end <= start;
+}
+
+function previousDateKey(dateStr) {
+  const dt = new Date(`${String(dateStr)}T00:00:00`);
+  if (!Number.isFinite(dt.getTime())) return null;
+  dt.setDate(dt.getDate() - 1);
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const d = String(dt.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 async function promoteEmployeeToCanonicalKey(pool, employeeId) {
   if (!employeeId) return;
   const canonical = buildCanonicalEmployeeKey(employeeId);
@@ -490,17 +518,24 @@ export async function applyTerminalEvent(pool, terminalRow, ev, broadcast) {
   const snap = await resolveSnapshotForTerminalEvent(terminalRow, ev);
 
   if (checkout) {
+    const candidateDates = [dt.date];
+    if (isOvernightShiftByRow(emp)) {
+      const prev = previousDateKey(dt.date);
+      if (prev && !candidateDates.includes(prev)) candidateDates.push(prev);
+    }
     const openR = await pool.query(
       `SELECT id FROM employee_attendance
-       WHERE employee_id = $1 AND record_date = $2::date
+       WHERE employee_id = $1
+         AND record_date = ANY($2::date[])
          AND (check_out IS NULL OR BTRIM(check_out::text) = '')
-       ORDER BY id DESC LIMIT 1`,
-      [eid, dt.date]
+       ORDER BY record_date DESC, id DESC
+       LIMIT 1`,
+      [eid, candidateDates]
     );
     if (openR.rows.length === 0) {
       return {
         ok: false,
-        reason: `chiqish_mumkin_emas: ${dt.date} sanasida ochiq kirish (check-in) topilmadi — avval kirish yozilishi kerak`,
+        reason: `chiqish_mumkin_emas: ${candidateDates.join(", ")} oralig'ida ochiq kirish (check-in) topilmadi — avval kirish yozilishi kerak`,
       };
     }
     const { rows } = await pool.query(
