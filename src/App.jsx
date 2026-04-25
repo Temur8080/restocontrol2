@@ -373,6 +373,42 @@ function isLate(checkInTime, shiftStart, graceMinutes) {
   return cin > st + g;
 }
 
+function resolvePolicyAmount(empPolicy, salaryPolicy, key) {
+  const empValue = Number(empPolicy?.[key]);
+  if (Number.isFinite(empValue)) return Math.max(0, Math.trunc(empValue));
+  const globalValue = Number(salaryPolicy?.[key]);
+  return Number.isFinite(globalValue) ? Math.max(0, Math.trunc(globalValue)) : 0;
+}
+
+function computeAutomaticFineForAttendance(att, shift, salaryPolicy, empPolicy, graceMinutes) {
+  if (!att?.current || !shift?.work) return { amount: 0, lateMin: 0, earlyLeaveMin: 0 };
+  const grace = Number.isFinite(Number(graceMinutes)) ? Math.max(0, Math.trunc(Number(graceMinutes))) : 0;
+  const perMinute = resolvePolicyAmount(empPolicy, salaryPolicy, "latePerMinute");
+  const maxDailyFine = resolvePolicyAmount(empPolicy, salaryPolicy, "maxDailyFine");
+  let lateMin = 0;
+  let earlyLeaveMin = 0;
+
+  if (att.current.checkIn) {
+    const startMin = toMinutes(shift.start || "09:00");
+    const inMin = toMinutes(att.current.checkIn || "00:00");
+    if (Number.isFinite(startMin) && Number.isFinite(inMin)) {
+      lateMin = Math.max(0, inMin - startMin - grace);
+    }
+  }
+
+  if (att.current.checkOut) {
+    const outMin = toMinutes(String(att.current.checkOut).trim());
+    const { endEff, coEff } = effectiveShiftEndAndCheckoutMinutes(shift.start || "09:00", shift.end || "18:00", outMin);
+    if (Number.isFinite(endEff) && Number.isFinite(coEff)) {
+      earlyLeaveMin = Math.max(0, endEff - coEff - grace);
+    }
+  }
+
+  const rawAmount = (lateMin + earlyLeaveMin) * perMinute;
+  const amount = maxDailyFine > 0 ? Math.min(maxDailyFine, rawAmount) : rawAmount;
+  return { amount: Math.max(0, Math.trunc(amount || 0)), lateMin, earlyLeaveMin };
+}
+
 function getAvatarClass(name) {
   return `small-avatar a${name.charCodeAt(0) % 6}`;
 }
@@ -1091,24 +1127,9 @@ function computeHisobotTableRowMetrics(employee, ctx) {
     if (dateStr < repFrom || dateStr > repTo) continue;
     const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, reportGrace);
     const shift = getShiftForDate(employee, dateStr);
-    if (
-      policyEnabled &&
-      att?.current?.checkIn &&
-      shift.work &&
-      isLate(String(att.current.checkIn).trim(), shift.start, reportGrace)
-    ) {
-      const startMin = toMinutes(shift.start || "09:00");
-      const inMin = toMinutes(att.current.checkIn || "00:00");
-      const perMinute = Number.isFinite(Number(empPolicy.latePerMinute))
-        ? Math.max(0, Math.trunc(Number(empPolicy.latePerMinute)))
-        : Math.max(0, Number(salaryPolicy?.latePerMinute) || 0);
-      const maxDailyFine = Number.isFinite(Number(empPolicy.maxDailyFine))
-        ? Math.max(0, Math.trunc(Number(empPolicy.maxDailyFine)))
-        : Math.max(0, Number(salaryPolicy?.maxDailyFine) || 0);
-      const lateMin = Math.max(0, inMin - startMin - reportGrace);
-      const rawAmount = lateMin > 0 ? lateMin * perMinute : 0;
-      const amount = maxDailyFine > 0 ? Math.min(maxDailyFine, rawAmount) : rawAmount;
-      if (amount > 0) fineByDate.set(dateStr, (fineByDate.get(dateStr) || 0) + amount);
+    if (policyEnabled) {
+      const fine = computeAutomaticFineForAttendance(att, shift, salaryPolicy, empPolicy, reportGrace);
+      if (fine.amount > 0) fineByDate.set(dateStr, (fineByDate.get(dateStr) || 0) + fine.amount);
     }
     if (policyEnabled && att?.current?.checkIn && shift.work) {
       const shiftDurMin = scheduledShiftDurationMinutes(shift.start || "09:00", shift.end || "18:00");
@@ -2229,24 +2250,9 @@ function App() {
         if (dateStr < rFrom || dateStr > rTo) continue;
         const att = getEmployeeAttendance(employee, attendanceRecords, dateStr, reportGrace);
         const shift = getShiftForDate(employee, dateStr);
-        if (
-          policyEnabled &&
-          att?.current?.checkIn &&
-          shift.work &&
-          isLate(String(att.current.checkIn).trim(), shift.start, reportGrace)
-        ) {
-          const startMin = toMinutes(shift.start || "09:00");
-          const inMin = toMinutes(att.current.checkIn || "00:00");
-          const perMinute = Number.isFinite(Number(empPolicy.latePerMinute))
-            ? Math.max(0, Math.trunc(Number(empPolicy.latePerMinute)))
-            : Math.max(0, Number(salaryPolicy?.latePerMinute) || 0);
-          const maxDailyFine = Number.isFinite(Number(empPolicy.maxDailyFine))
-            ? Math.max(0, Math.trunc(Number(empPolicy.maxDailyFine)))
-            : Math.max(0, Number(salaryPolicy?.maxDailyFine) || 0);
-          const lateMin = Math.max(0, inMin - startMin - reportGrace);
-          const rawAmount = lateMin > 0 ? lateMin * perMinute : 0;
-          const amount = maxDailyFine > 0 ? Math.min(maxDailyFine, rawAmount) : rawAmount;
-          fineMonth += Math.max(0, Math.trunc(amount || 0));
+        if (policyEnabled) {
+          const fine = computeAutomaticFineForAttendance(att, shift, salaryPolicy, empPolicy, reportGrace);
+          fineMonth += fine.amount;
         }
         if (policyEnabled && att?.current?.checkIn && shift.work) {
           const shiftDurMin = scheduledShiftDurationMinutes(shift.start || "09:00", shift.end || "18:00");
@@ -2740,24 +2746,18 @@ function App() {
         });
       }
       const empPolicy = salaryPolicyEmployeeOverrides?.[String(reportDetailEmployee.id)] || {};
-      if (
-        policyEnabled &&
-        att?.current?.checkIn &&
-        shift.work &&
-        isLate(String(att.current.checkIn).trim(), shift.start, reportGrace)
-      ) {
-        const startMin = toMinutes(shift.start || "09:00");
-        const inMin = toMinutes(att.current.checkIn || "00:00");
-        const perMinute = Number.isFinite(Number(empPolicy.latePerMinute))
-          ? Math.max(0, Math.trunc(Number(empPolicy.latePerMinute)))
-          : Math.max(0, Number(salaryPolicy?.latePerMinute) || 0);
-        const maxDailyFine = Number.isFinite(Number(empPolicy.maxDailyFine))
-          ? Math.max(0, Math.trunc(Number(empPolicy.maxDailyFine)))
-          : Math.max(0, Number(salaryPolicy?.maxDailyFine) || 0);
-        const lateMin = Math.max(0, inMin - startMin - reportGrace);
-        const rawAmount = lateMin > 0 ? lateMin * perMinute : 0;
-        const amount = maxDailyFine > 0 ? Math.min(maxDailyFine, rawAmount) : rawAmount;
-        if (amount > 0) fineItems.push({ date: dateStr, lateMin, amount, auto: true, note: "Kechikish" });
+      if (policyEnabled) {
+        const fine = computeAutomaticFineForAttendance(att, shift, salaryPolicy, empPolicy, reportGrace);
+        if (fine.amount > 0) {
+          fineItems.push({
+            date: dateStr,
+            lateMin: fine.lateMin,
+            earlyLeaveMin: fine.earlyLeaveMin,
+            amount: fine.amount,
+            auto: true,
+            note: "Kechikish / erta ketish",
+          });
+        }
       }
       if (policyEnabled && att?.current?.checkIn) {
         if (shift?.work) {
@@ -6828,7 +6828,16 @@ function App() {
                             <strong>{formatAttendanceDate(item.date, locale)}</strong>
                             <small>
                               {item.auto
-                                ? `${t("report.detailLatePrefix")}: ${item.lateMin || 0} ${t("report.detailMinUnit")}`
+                                ? [
+                                    item.lateMin > 0
+                                      ? `${t("report.detailLatePrefix")}: ${item.lateMin} ${t("report.detailMinUnit")}`
+                                      : "",
+                                    item.earlyLeaveMin > 0
+                                      ? `${t("report.detailEarlyLeavePrefix")}: ${item.earlyLeaveMin} ${t("report.detailMinUnit")}`
+                                      : "",
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" / ")
                                 : item.note || t("report.detailManualFine")}
                             </small>
                           </div>
